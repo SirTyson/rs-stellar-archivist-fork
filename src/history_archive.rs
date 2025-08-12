@@ -8,7 +8,51 @@ use serde::{Deserialize, Serialize};
 // Stellar bucketlist has exactly 11 levels
 const NUM_BUCKETLIST_LEVELS: usize = 11;
 // Checkpoints occur every 64 ledgers
-const CHECKPOINT_FREQUENCY: u32 = 64;
+pub const CHECKPOINT_FREQUENCY: u32 = 64;
+
+// Archive file categories
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileCategory {
+    History,
+    Ledger,
+    Transactions,
+    Results,
+    Scp,
+    Bucket,
+}
+
+impl FileCategory {
+    pub fn as_str(&self) -> &str {
+        match self {
+            FileCategory::History => "history",
+            FileCategory::Ledger => "ledger",
+            FileCategory::Transactions => "transactions",
+            FileCategory::Results => "results",
+            FileCategory::Scp => "scp",
+            FileCategory::Bucket => "bucket",
+        }
+    }
+
+    pub fn extension(&self) -> &str {
+        match self {
+            FileCategory::History => "json",
+            _ => "xdr.gz",
+        }
+    }
+
+    pub fn is_optional(&self) -> bool {
+        matches!(self, FileCategory::Scp)
+    }
+
+    pub fn required_categories() -> &'static [FileCategory] {
+        &[
+            FileCategory::History,
+            FileCategory::Ledger,
+            FileCategory::Transactions,
+            FileCategory::Results,
+        ]
+    }
+}
 // Standard location for HAS file in archives
 pub const ROOT_HAS_PATH: &str = ".well-known/stellar-history.json";
 
@@ -53,15 +97,19 @@ pub struct NextState {
 
 impl HistoryArchiveState {
     // Helper function to validate a single bucket level
-    fn validate_bucket_level(level: &BucketLevel, index: usize, prefix: &str) -> Result<(), String> {
+    fn validate_bucket_level(
+        level: &BucketLevel,
+        index: usize,
+        prefix: &str,
+    ) -> Result<(), String> {
         if !is_valid_bucket_hash(&level.curr) {
             return Err(format!("invalid bucket hash {}", level.curr));
         }
-        
+
         if !is_valid_bucket_hash(&level.snap) {
             return Err(format!("invalid bucket hash {}", level.snap));
         }
-        
+
         // Validate next state
         match level.next.state {
             0 => {
@@ -113,7 +161,7 @@ impl HistoryArchiveState {
                         return Err(format!("invalid bucket hash {}", curr));
                     }
                 }
-                
+
                 if level.next.snap.is_none() {
                     return Err(format!(
                         "{} level {} next state is 2 but missing snap field",
@@ -124,7 +172,7 @@ impl HistoryArchiveState {
                         return Err(format!("invalid bucket hash {}", snap));
                     }
                 }
-                
+
                 if let Some(ref shadow) = level.next.shadow {
                     for hash in shadow.iter() {
                         if !is_valid_bucket_hash(hash) {
@@ -140,16 +188,19 @@ impl HistoryArchiveState {
                 ));
             }
         }
-        
+
         Ok(())
     }
-    
+
     // Validate HAS format for basic structural/string correctness
     pub fn validate(&self) -> Result<(), String> {
         if self.version != 1 && self.version != 2 {
-            return Err(format!("Invalid version: expected 1 or 2, got {}", self.version));
+            return Err(format!(
+                "Invalid version: expected 1 or 2, got {}",
+                self.version
+            ));
         }
-        
+
         // Version 2 must have hotArchiveBuckets, version 1 must not
         if self.version == 2 && self.hot_archive_buckets.is_none() {
             return Err("Version 2 HAS must have hotArchiveBuckets field".to_string());
@@ -171,7 +222,7 @@ impl HistoryArchiveState {
         for (i, level) in self.current_buckets.iter().enumerate() {
             Self::validate_bucket_level(level, i, "Live")?;
         }
-        
+
         // If version 2, also validate hotArchiveBuckets
         if let Some(ref hot_buckets) = self.hot_archive_buckets {
             for (i, level) in hot_buckets.iter().enumerate() {
@@ -185,7 +236,7 @@ impl HistoryArchiveState {
     // Extract all unique bucket hashes from current state, except for empty buckets with 0 hash
     pub fn buckets(&self) -> Vec<String> {
         let mut result = Vec::new();
-        
+
         // Collect from currentBuckets
         for level in &self.current_buckets {
             if !level.curr.is_empty() && !is_zero_hash(&level.curr) {
@@ -200,7 +251,7 @@ impl HistoryArchiveState {
                 }
             }
         }
-        
+
         // Collect from hotArchiveBuckets if present (version 2)
         if let Some(ref hot_buckets) = self.hot_archive_buckets {
             for level in hot_buckets {
@@ -217,7 +268,7 @@ impl HistoryArchiveState {
                 }
             }
         }
-        
+
         result.sort();
         result.dedup();
         result
@@ -288,10 +339,34 @@ pub fn bucket_path(hash: &str) -> Result<String, String> {
     Ok(format!("bucket/{}/bucket-{}.xdr.gz", prefix, hash))
 }
 
-// Generate archive path for checkpoint file
-// Path structure: category/XX/YY/ZZ/category-CHECKPOINT.ext
-// where XX/YY/ZZ are the upper 3 bytes of the checkpoint number in hex
-// (e.g., "ledger", 0x01020300 -> "ledger/01/02/03/ledger-01020300.xdr.gz")
+/// Extract checkpoint number from a checkpoint filename like "history-0000137f.json"
+pub fn checkpoint_from_filename(filename: &str) -> Option<u32> {
+    let hex_start = filename.rfind('-')?;
+    let hex_part = &filename[hex_start + 1..];
+    let hex_part = hex_part
+        .trim_end_matches(".xdr.gz")
+        .trim_end_matches(".json");
+    u32::from_str_radix(hex_part, 16).ok()
+}
+
+/// Extract bucket hash from a bucket filename like "bucket-b5c7cd74192aa750429bfaa8cde27a41a729643a194fb474be765da982ece22a.xdr.gz"
+pub fn bucket_hash_from_filename(filename: &str) -> Option<String> {
+    if !filename.starts_with("bucket-") {
+        return None;
+    }
+    let hash_start = filename.find('-')? + 1;
+    let hash_end = filename.find(".xdr.gz")?;
+    let hash = &filename[hash_start..hash_end];
+
+    // Validate it's a proper bucket hash (64 hex chars)
+    if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(hash.to_string())
+    } else {
+        None
+    }
+}
+
+// Generate archive path for checkpoint file using string category (for backwards compatibility)
 pub fn checkpoint_path(category: &str, checkpoint: u32) -> String {
     // All files are compressed except history archive files.
     let ext = match category {
@@ -302,6 +377,19 @@ pub fn checkpoint_path(category: &str, checkpoint: u32) -> String {
     format!(
         "{}/{}/{}-{:08x}.{}",
         category, prefix, category, checkpoint, ext
+    )
+}
+
+// Generate archive path for checkpoint file using FileCategory enum
+pub fn checkpoint_path_typed(category: FileCategory, checkpoint: u32) -> String {
+    let prefix = checkpoint_prefix(checkpoint);
+    format!(
+        "{}/{}/{}-{:08x}.{}",
+        category.as_str(),
+        prefix,
+        category.as_str(),
+        checkpoint,
+        category.extension()
     )
 }
 
@@ -341,5 +429,28 @@ pub fn enumerate_all_files_with_optional(has: &HistoryArchiveState) -> Vec<Strin
     }
 
     files.sort();
+    files
+}
+
+// List all checkpoint files for the given HAS (without buckets or root HAS)
+pub fn enumerate_checkpoint_files(
+    has: &HistoryArchiveState,
+    include_optional: bool,
+) -> Vec<String> {
+    let mut files = Vec::new();
+    let checkpoints = has.get_checkpoint_range();
+
+    for checkpoint in checkpoints {
+        // Add all required categories
+        for category in FileCategory::required_categories() {
+            files.push(checkpoint_path_typed(*category, checkpoint));
+        }
+
+        // Add optional SCP if requested
+        if include_optional {
+            files.push(checkpoint_path_typed(FileCategory::Scp, checkpoint));
+        }
+    }
+
     files
 }

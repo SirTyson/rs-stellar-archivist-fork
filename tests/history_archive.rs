@@ -551,10 +551,8 @@ fn test_invalid_json_structure(mut canonical_v1_json: serde_json::Value) {
 fn test_wrong_number_of_bucket_levels(mut canonical_v1_json: serde_json::Value) {
     // Replace currentBuckets with only 2 levels instead of 11
     let buckets = canonical_v1_json["currentBuckets"].as_array().unwrap();
-    canonical_v1_json["currentBuckets"] = serde_json::json!([
-        buckets[0].clone(),
-        buckets[1].clone()
-    ]);
+    canonical_v1_json["currentBuckets"] =
+        serde_json::json!([buckets[0].clone(), buckets[1].clone()]);
 
     let mut temp_file = NamedTempFile::new().unwrap();
     writeln!(
@@ -608,14 +606,21 @@ fn test_get_checkpoint_range(mut canonical_v1_json: serde_json::Value) {
     assert_eq!(checkpoints_up_to(191), vec![63, 127, 191]);
     assert_eq!(checkpoints_up_to(200), vec![63, 127, 191]);
     assert_eq!(checkpoints_up_to(255), vec![63, 127, 191, 255]);
-    assert_eq!(checkpoints_up_to(511), vec![63, 127, 191, 255, 319, 383, 447, 511]);
-    
+    assert_eq!(
+        checkpoints_up_to(511),
+        vec![63, 127, 191, 255, 319, 383, 447, 511]
+    );
+
     // Verify all generated checkpoints are valid
     for ledger in [100, 500, 1000, 10000] {
         let checkpoints = checkpoints_up_to(ledger);
         for checkpoint in checkpoints {
-            assert!(is_checkpoint(checkpoint), 
-                "Generated checkpoint {} for ledger {} should be valid", checkpoint, ledger);
+            assert!(
+                is_checkpoint(checkpoint),
+                "Generated checkpoint {} for ledger {} should be valid",
+                checkpoint,
+                ledger
+            );
         }
     }
 }
@@ -701,12 +706,12 @@ fn test_canonical_v2_file_deserialization(canonical_v2_has: HistoryArchiveState)
         canonical_v2_has.network_passphrase.as_deref(),
         Some("Test SDF Network ; September 2015")
     );
-    
+
     // Verify v2 has hotArchiveBuckets
     assert!(canonical_v2_has.hot_archive_buckets.is_some());
     let hot_buckets = canonical_v2_has.hot_archive_buckets.as_ref().unwrap();
     assert_eq!(hot_buckets.len(), 11);
-    
+
     // Check a few hot bucket values
     assert_eq!(
         hot_buckets[0].curr,
@@ -726,18 +731,24 @@ fn test_canonical_v2_file_deserialization(canonical_v2_has: HistoryArchiveState)
 #[rstest]
 fn test_version_2_missing_hot_archive_buckets(mut canonical_v2_json: serde_json::Value) {
     // Remove hotArchiveBuckets from a version 2 HAS
-    canonical_v2_json.as_object_mut().unwrap().remove("hotArchiveBuckets");
-    
+    canonical_v2_json
+        .as_object_mut()
+        .unwrap()
+        .remove("hotArchiveBuckets");
+
     let has: HistoryArchiveState = serde_json::from_value(canonical_v2_json).unwrap();
     let error = has.validate().unwrap_err();
     assert!(error.contains("Version 2 HAS must have hotArchiveBuckets field"));
 }
 
 #[rstest]
-fn test_version_1_with_hot_archive_buckets(mut canonical_v1_json: serde_json::Value, canonical_v2_json: serde_json::Value) {
+fn test_version_1_with_hot_archive_buckets(
+    mut canonical_v1_json: serde_json::Value,
+    canonical_v2_json: serde_json::Value,
+) {
     // Add hotArchiveBuckets from v2 to a version 1 HAS
     canonical_v1_json["hotArchiveBuckets"] = canonical_v2_json["hotArchiveBuckets"].clone();
-    
+
     let has: HistoryArchiveState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
     assert!(error.contains("Version 1 HAS must not have hotArchiveBuckets field"));
@@ -746,44 +757,56 @@ fn test_version_1_with_hot_archive_buckets(mut canonical_v1_json: serde_json::Va
 #[rstest]
 fn test_version_1_buckets_method(canonical_v1_has: HistoryArchiveState) {
     let buckets = canonical_v1_has.buckets();
-    
+
     // Should not contain zero hashes
-    assert!(!buckets.contains(&"0000000000000000000000000000000000000000000000000000000000000000".to_string()));
-    
+    assert!(!buckets
+        .contains(&"0000000000000000000000000000000000000000000000000000000000000000".to_string()));
+
     // Check some known buckets from v1
-    assert!(buckets.contains(&"5a7e9c8d4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d".to_string()));
-    assert!(buckets.contains(&"9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c".to_string()));
-    
+    assert!(buckets
+        .contains(&"5a7e9c8d4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d".to_string()));
+    assert!(buckets
+        .contains(&"9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c".to_string()));
+
     // Verify we have a reasonable number of unique buckets
-    assert!(buckets.len() > 10, "Should have collected many unique bucket hashes");
+    assert!(
+        buckets.len() > 10,
+        "Should have collected many unique bucket hashes"
+    );
 }
 
 #[rstest]
 fn test_version_2_buckets_method(canonical_v2_has: HistoryArchiveState) {
     let buckets = canonical_v2_has.buckets();
-    
+
     // The buckets() method should collect all unique non-zero hashes from both
     // currentBuckets and hotArchiveBuckets
-    
+
     // Should not contain zero hashes
-    assert!(!buckets.contains(&"0000000000000000000000000000000000000000000000000000000000000000".to_string()));
-    
+    assert!(!buckets
+        .contains(&"0000000000000000000000000000000000000000000000000000000000000000".to_string()));
+
     // Check that we got buckets from both arrays
     // From currentBuckets
-    assert!(buckets.contains(&"5a7e9c8d4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d".to_string()));
-    
+    assert!(buckets
+        .contains(&"5a7e9c8d4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d".to_string()));
+
     // From hotArchiveBuckets
-    assert!(buckets.contains(&"1a2b3c4d5e6f7081928394a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5".to_string()));
-    
+    assert!(buckets
+        .contains(&"1a2b3c4d5e6f7081928394a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5".to_string()));
+
     // Verify we have a reasonable number of unique buckets
-    assert!(buckets.len() > 20, "Should have collected many unique bucket hashes");
+    assert!(
+        buckets.len() > 20,
+        "Should have collected many unique bucket hashes"
+    );
 }
 
 #[rstest]
 fn test_version_2_hot_bucket_validation(mut canonical_v2_json: serde_json::Value) {
     // Modify first hot bucket to have an invalid hash
     canonical_v2_json["hotArchiveBuckets"][0]["curr"] = serde_json::json!("invalid_hash");
-    
+
     let has: HistoryArchiveState = serde_json::from_value(canonical_v2_json).unwrap();
     let error = has.validate().unwrap_err();
     assert!(error.contains("invalid bucket hash"));

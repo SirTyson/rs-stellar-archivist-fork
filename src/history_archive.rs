@@ -276,7 +276,17 @@ impl HistoryArchiveState {
 
     // Get all checkpoint ledger numbers up to current_ledger
     pub fn get_checkpoint_range(&self) -> Vec<u32> {
-        let mut checkpoints = Vec::new();
+        // For very large ranges, warn about memory usage
+        let num_checkpoints = (self.current_ledger / CHECKPOINT_FREQUENCY) as usize;
+        if num_checkpoints > 10000 {
+            tracing::warn!(
+                "Generating {} checkpoints up to ledger {} - this may use significant memory",
+                num_checkpoints,
+                self.current_ledger
+            );
+        }
+
+        let mut checkpoints = Vec::with_capacity(num_checkpoints);
         let mut checkpoint = CHECKPOINT_FREQUENCY - 1; // Start at first checkpoint (63)
 
         while checkpoint <= self.current_ledger {
@@ -450,6 +460,27 @@ pub fn enumerate_checkpoint_files(
         if include_optional {
             files.push(checkpoint_path_typed(FileCategory::Scp, checkpoint));
         }
+    }
+
+    files
+}
+
+/// Generate list of files for a specific checkpoint
+pub fn enumerate_checkpoint_files_for(
+    _has: &HistoryArchiveState,
+    checkpoint: u32,
+    include_optional: bool,
+) -> Vec<String> {
+    let mut files = Vec::new();
+
+    // Add all required categories
+    for category in FileCategory::required_categories() {
+        files.push(checkpoint_path_typed(*category, checkpoint));
+    }
+
+    // Add optional SCP if requested
+    if include_optional {
+        files.push(checkpoint_path_typed(FileCategory::Scp, checkpoint));
     }
 
     files

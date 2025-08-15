@@ -203,11 +203,12 @@ async fn test_mirror_and_scan_roundtrip() {
         dst: format!("file://{}", mirror_dest1),
         concurrency: 4,
         skip_optional: false,
+        http_connections: 256,
         high: None,
-        force: false,
-        window_size: None,
+        low: None,
+        overwrite: false,
+        allow_mirror_gaps: false,
         max_bucket_cache: None,
-        window_workers: None,
     };
 
     cmd_mirror::run(mirror_config)
@@ -219,6 +220,9 @@ async fn test_mirror_and_scan_roundtrip() {
         archive: format!("file://{}", mirror_dest1),
         concurrency: 4,
         skip_optional: false,
+        http_connections: 256,
+        low: None,
+        high: None,
     };
 
     cmd_scan::run(scan_config)
@@ -235,11 +239,12 @@ async fn test_mirror_and_scan_roundtrip() {
         dst: format!("file://{}", mirror_dest2),
         concurrency: 4,
         skip_optional: false,
+        http_connections: 256,
         high: Some(4991),
-        force: false,
-        window_size: None,
+        low: None,
+        overwrite: false,
+        allow_mirror_gaps: false,
         max_bucket_cache: None,
-        window_workers: None,
     };
 
     cmd_mirror::run(mirror_config)
@@ -250,6 +255,9 @@ async fn test_mirror_and_scan_roundtrip() {
         archive: format!("file://{}", mirror_dest2),
         concurrency: 4,
         skip_optional: false,
+        http_connections: 256,
+        low: None,
+        high: None,
     };
 
     cmd_scan::run(scan_config)
@@ -266,11 +274,12 @@ async fn test_mirror_and_scan_roundtrip() {
         dst: format!("file://{}", mirror_dest3),
         concurrency: 4,
         skip_optional: true,
+        http_connections: 256,
         high: None,
-        force: false,
-        window_size: None,
+        low: None,
+        overwrite: false,
+        allow_mirror_gaps: false,
         max_bucket_cache: None,
-        window_workers: None,
     };
 
     cmd_mirror::run(mirror_config)
@@ -289,6 +298,9 @@ async fn test_mirror_and_scan_roundtrip() {
         archive: format!("file://{}", mirror_dest3),
         concurrency: 4,
         skip_optional: true,
+        http_connections: 256,
+        low: None,
+        high: None,
     };
 
     cmd_scan::run(scan_config)
@@ -314,11 +326,12 @@ async fn test_mirror() {
         dst: format!("file://{}", mirror_dest),
         concurrency: 20,
         skip_optional: false,
+        http_connections: 256,
         high: None,
-        force: false,
-        window_size: None,
+        low: None,
+        overwrite: false,
+        allow_mirror_gaps: false,
         max_bucket_cache: None,
-        window_workers: None,
     };
 
     cmd_mirror::run(mirror_config)
@@ -356,11 +369,12 @@ async fn test_mirror() {
         dst: format!("file://{}", mirror_dest2),
         concurrency: 20,
         skip_optional: false,
+        http_connections: 256,
         high: Some(4991),
-        force: false,
-        window_size: None,
+        low: None,
+        overwrite: false,
+        allow_mirror_gaps: false,
         max_bucket_cache: None,
-        window_workers: None,
     };
 
     cmd_mirror::run(mirror_config)

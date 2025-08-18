@@ -1,11 +1,11 @@
 //! Tests for command-line interface validation and error handling
 
-use stellar_archivist::cmd_mirror;
+use stellar_archivist::test_helpers::{run_mirror as cmd_mirror_run, MirrorConfig};
 
 #[tokio::test]
 async fn test_mirror_rejects_http_destination() {
     // HTTP destinations are read-only
-    let config = cmd_mirror::MirrorConfig {
+    let config = MirrorConfig {
         src: "file:///tmp/test-source".to_string(),
         dst: "http://example.com/archive".to_string(),
         concurrency: 4,
@@ -15,17 +15,16 @@ async fn test_mirror_rejects_http_destination() {
         overwrite: false,
         allow_mirror_gaps: false,
         max_bucket_cache: None,
-        http_connections: 256,
     };
 
-    let result = cmd_mirror::run(config).await;
+    let result = cmd_mirror_run(config).await;
     assert!(result.is_err(), "Should reject HTTP destination");
 }
 
 #[tokio::test]
 async fn test_mirror_rejects_https_destination() {
     // HTTPS destinations are also read-only
-    let config = cmd_mirror::MirrorConfig {
+    let config = MirrorConfig {
         src: "file:///tmp/test-source".to_string(),
         dst: "https://example.com/archive".to_string(),
         concurrency: 4,
@@ -35,17 +34,16 @@ async fn test_mirror_rejects_https_destination() {
         overwrite: false,
         allow_mirror_gaps: false,
         max_bucket_cache: None,
-        http_connections: 256,
     };
 
-    let result = cmd_mirror::run(config).await;
+    let result = cmd_mirror_run(config).await;
     assert!(result.is_err(), "Should reject HTTPS destination");
 }
 
 #[tokio::test]
 async fn test_mirror_rejects_s3_destination() {
     // S3 destinations are not currently supported for writing
-    let config = cmd_mirror::MirrorConfig {
+    let config = MirrorConfig {
         src: "file:///tmp/test-source".to_string(),
         dst: "s3://my-bucket/archive".to_string(),
         concurrency: 4,
@@ -55,10 +53,9 @@ async fn test_mirror_rejects_s3_destination() {
         overwrite: false,
         allow_mirror_gaps: false,
         max_bucket_cache: None,
-        http_connections: 256,
     };
 
-    let result = cmd_mirror::run(config).await;
+    let result = cmd_mirror_run(config).await;
     assert!(result.is_err(), "Should reject S3 destination");
 
     let err_msg = result.unwrap_err().to_string();
@@ -83,7 +80,7 @@ async fn test_mirror_rejects_malformed_source_url() {
     ];
 
     for bad_src in test_cases {
-        let config = cmd_mirror::MirrorConfig {
+        let config = MirrorConfig {
             src: bad_src.to_string(),
             dst: "file:///tmp/test-dest".to_string(),
             concurrency: 4,
@@ -93,10 +90,9 @@ async fn test_mirror_rejects_malformed_source_url() {
             overwrite: false,
             allow_mirror_gaps: false,
             max_bucket_cache: None,
-            http_connections: 256,
         };
 
-        let result = cmd_mirror::run(config).await;
+        let result = cmd_mirror_run(config).await;
         assert!(
             result.is_err(),
             "Should reject malformed source URL: '{}'",
@@ -111,7 +107,7 @@ async fn test_mirror_rejects_malformed_destination_url() {
     let test_cases = vec!["not-a-url", "://missing-scheme", "file:/missing-slash", ""];
 
     for bad_dst in test_cases {
-        let config = cmd_mirror::MirrorConfig {
+        let config = MirrorConfig {
             src: "file:///tmp/test-source".to_string(),
             dst: bad_dst.to_string(),
             concurrency: 4,
@@ -121,10 +117,9 @@ async fn test_mirror_rejects_malformed_destination_url() {
             overwrite: false,
             allow_mirror_gaps: false,
             max_bucket_cache: None,
-            http_connections: 256,
         };
 
-        let result = cmd_mirror::run(config).await;
+        let result = cmd_mirror_run(config).await;
         assert!(
             result.is_err(),
             "Should reject malformed destination URL: '{}'",
@@ -136,7 +131,7 @@ async fn test_mirror_rejects_malformed_destination_url() {
 #[tokio::test]
 async fn test_mirror_rejects_nonexistent_source() {
     // Source that doesn't exist should fail gracefully
-    let config = cmd_mirror::MirrorConfig {
+    let config = MirrorConfig {
         src: "file:///this/path/does/not/exist/at/all".to_string(),
         dst: "file:///tmp/test-dest".to_string(),
         concurrency: 4,
@@ -146,11 +141,34 @@ async fn test_mirror_rejects_nonexistent_source() {
         overwrite: false,
         allow_mirror_gaps: false,
         max_bucket_cache: None,
-        http_connections: 256,
     };
 
-    let result = cmd_mirror::run(config).await;
+    let result = cmd_mirror_run(config).await;
     assert!(result.is_err(), "Should reject nonexistent source");
+}
+
+#[tokio::test]
+async fn test_scan_rejects_nonexistent_source() {
+    use stellar_archivist::test_helpers::{run_scan as cmd_scan_run, ScanConfig};
+
+    // Source that doesn't exist should fail with a clear error
+    let config = ScanConfig {
+        archive: "file:///this/path/does/not/exist/at/all".to_string(),
+        concurrency: 4,
+        skip_optional: false,
+        low: None,
+        high: None,
+    };
+
+    let result = cmd_scan_run(config).await;
+    assert!(result.is_err(), "Should reject nonexistent source");
+
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("does not exist") || err_msg.contains("not found"),
+        "Error should clearly indicate the source doesn't exist, got: {}",
+        err_msg
+    );
 }
 
 #[tokio::test]
@@ -166,7 +184,7 @@ async fn test_mirror_creates_destination_if_not_exists() {
     let temp_base = TempDir::new().expect("Failed to create temp base");
     let dest_path = temp_base.path().join("new-dest-directory");
 
-    let config = cmd_mirror::MirrorConfig {
+    let config = MirrorConfig {
         src: format!("file://{}", test_archive_path.display()),
         dst: format!("file://{}", dest_path.display()),
         concurrency: 4,
@@ -176,10 +194,9 @@ async fn test_mirror_creates_destination_if_not_exists() {
         overwrite: false,
         allow_mirror_gaps: false,
         max_bucket_cache: None,
-        http_connections: 256,
     };
 
-    let result = cmd_mirror::run(config).await;
+    let result = cmd_mirror_run(config).await;
     assert!(
         result.is_ok(),
         "Should create destination directory if it doesn't exist, got error: {:?}",

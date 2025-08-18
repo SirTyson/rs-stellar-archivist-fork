@@ -4,7 +4,7 @@ use axum::{body::Body, response::Response, routing::get_service, Router};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use stellar_archivist::{cmd_mirror, cmd_scan};
+use stellar_archivist::test_helpers::{run_mirror, run_scan, MirrorConfig, ScanConfig};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
@@ -47,16 +47,15 @@ async fn test_scan_http_archive() {
     let (server_url, server_handle) = start_test_http_server(&test_archive_path).await;
 
     // Scan the archive via HTTP
-    let scan_config = cmd_scan::ScanConfig {
+    let scan_config = ScanConfig {
         archive: server_url.clone(),
         concurrency: 4,
         skip_optional: false,
-        http_connections: 256,
         low: None,
         high: None,
     };
 
-    match cmd_scan::run(scan_config).await {
+    match run_scan(scan_config).await {
         Ok(_) => (),
         Err(e) => {
             server_handle.abort();
@@ -79,14 +78,13 @@ async fn test_mirror_http_to_filesystem() {
     let mirror_dest = temp_dir.path().to_str().unwrap();
 
     // Mirror from HTTP to filesystem
-    let mirror_config = cmd_mirror::MirrorConfig {
+    let mirror_config = MirrorConfig {
         src: server_url.clone(),
         dst: format!("file://{}", mirror_dest),
         concurrency: 4,
         high: None,
         low: None,
         skip_optional: false,
-        http_connections: 256,
         overwrite: false,
         allow_mirror_gaps: false,
         max_bucket_cache: None,
@@ -97,7 +95,7 @@ async fn test_mirror_http_to_filesystem() {
         server_url, mirror_dest
     );
 
-    match cmd_mirror::run(mirror_config).await {
+    match run_mirror(mirror_config).await {
         Ok(_) => (),
         Err(e) => {
             server_handle.abort();
@@ -106,18 +104,17 @@ async fn test_mirror_http_to_filesystem() {
     }
 
     // Verify the mirrored archive
-    let scan_config = cmd_scan::ScanConfig {
+    let scan_config = ScanConfig {
         archive: format!("file://{}", mirror_dest),
         concurrency: 4,
         skip_optional: false,
-        http_connections: 256,
         low: None,
         high: None,
     };
 
     println!("Scanning mirrored archive...");
 
-    match cmd_scan::run(scan_config).await {
+    match run_scan(scan_config).await {
         Ok(_) => (),
         Err(e) => {
             server_handle.abort();
@@ -154,18 +151,17 @@ async fn test_http_server_with_missing_files() {
     let (server_url, server_handle) = start_test_http_server(archive_path).await;
 
     // Try to scan the partial archive via HTTP
-    let scan_config = cmd_scan::ScanConfig {
+    let scan_config = ScanConfig {
         archive: server_url.clone(),
         concurrency: 4,
         skip_optional: true,
-        http_connections: 256,
         low: None,
         high: None,
     };
 
     println!("Scanning partial archive via HTTP from {}", server_url);
 
-    match cmd_scan::run(scan_config).await {
+    match run_scan(scan_config).await {
         Ok(_) => {
             server_handle.abort();
             panic!("Scan should have failed due to missing files");
@@ -214,14 +210,13 @@ async fn test_mirror_writes_has_despite_failures() {
     let mirror_dest = temp_dest.path().to_str().unwrap();
 
     // Mirror from HTTP to filesystem (should have some failures)
-    let mirror_config = cmd_mirror::MirrorConfig {
+    let mirror_config = MirrorConfig {
         src: server_url.clone(),
         dst: format!("file://{}", mirror_dest),
         concurrency: 4,
         high: Some(255), // Small range for faster test
         low: None,
         skip_optional: true,
-        http_connections: 256,
         overwrite: false,
         allow_mirror_gaps: false,
         max_bucket_cache: None,
@@ -233,7 +228,7 @@ async fn test_mirror_writes_has_despite_failures() {
     );
 
     // Mirror should fail due to unreadable files
-    match cmd_mirror::run(mirror_config).await {
+    match run_mirror(mirror_config).await {
         Ok(_) => {
             server_handle.abort();
             panic!("Mirror should have reported failures");
@@ -285,14 +280,13 @@ async fn test_mirror_copies_json_content_file_to_file() {
     let mirror_dest = temp_dir.path().to_str().unwrap();
 
     // Mirror from file to file
-    let mirror_config = cmd_mirror::MirrorConfig {
+    let mirror_config = MirrorConfig {
         src: format!("file://{}", test_archive_path.to_str().unwrap()),
         dst: format!("file://{}", mirror_dest),
         concurrency: 4,
         high: Some(127), // Small range for faster test
         low: None,
         skip_optional: true,
-        http_connections: 256,
         overwrite: false,
         allow_mirror_gaps: false,
         max_bucket_cache: None,
@@ -304,7 +298,7 @@ async fn test_mirror_copies_json_content_file_to_file() {
         mirror_dest
     );
 
-    match cmd_mirror::run(mirror_config).await {
+    match run_mirror(mirror_config).await {
         Ok(_) => println!("Mirror completed successfully"),
         Err(e) => {
             panic!("Mirror failed: {}", e);
@@ -484,14 +478,13 @@ async fn test_mirror_race_condition_with_advancing_has() {
     let temp_dest = TempDir::new().expect("Failed to create temp dir");
     let mirror_dest = temp_dest.path().to_str().unwrap();
 
-    let mirror_config = cmd_mirror::MirrorConfig {
+    let mirror_config = MirrorConfig {
         src: server_url.clone(),
         dst: format!("file://{}", mirror_dest),
         concurrency: 4,
         high: None, // Unbounded mirror
         low: None,
         skip_optional: true,
-        http_connections: 256,
         overwrite: false,
         allow_mirror_gaps: false,
         max_bucket_cache: None,
@@ -499,7 +492,7 @@ async fn test_mirror_race_condition_with_advancing_has() {
 
     println!("Mirroring from {} to {}", server_url, mirror_dest);
 
-    match cmd_mirror::run(mirror_config).await {
+    match run_mirror(mirror_config).await {
         Ok(_) => println!("Mirror completed"),
         Err(e) => {
             server_handle.abort();
@@ -645,14 +638,13 @@ async fn test_diagnose_real_testnet_json_bug() {
     let mirror_dest = temp_dir.path().to_str().unwrap();
 
     // Mirror a tiny range from real testnet
-    let mirror_config = cmd_mirror::MirrorConfig {
+    let mirror_config = MirrorConfig {
         src: "http://history.stellar.org/prd/core-testnet/core_testnet_001".to_string(),
         dst: format!("file://{}", mirror_dest),
         concurrency: 1, // Use single thread to make debugging easier
         high: Some(63), // Just the first checkpoint
         low: None,
         skip_optional: true,
-        http_connections: 256,
         overwrite: false,
         allow_mirror_gaps: false,
         max_bucket_cache: None,
@@ -660,7 +652,7 @@ async fn test_diagnose_real_testnet_json_bug() {
 
     println!("   - Mirroring from real testnet to {}", mirror_dest);
 
-    match cmd_mirror::run(mirror_config).await {
+    match run_mirror(mirror_config).await {
         Ok(_) => println!("   - Mirror completed successfully"),
         Err(e) => {
             println!("   - Mirror had errors: {}", e);
@@ -827,16 +819,15 @@ async fn test_http_chunked_transfer_encoding() {
     );
 
     // Try to scan the archive - this should fail with current implementation
-    let scan_config = cmd_scan::ScanConfig {
+    let scan_config = ScanConfig {
         archive: server_url.clone(),
         concurrency: 4,
         skip_optional: true,
-        http_connections: 256,
         low: None,
         high: None,
     };
 
-    match cmd_scan::run(scan_config).await {
+    match run_scan(scan_config).await {
         Ok(_) => {
             println!("✓ Scan succeeded with chunked transfer encoding!");
         }
@@ -857,14 +848,13 @@ async fn test_http_chunked_transfer_encoding() {
     let temp_dest = TempDir::new().expect("Failed to create temp dir");
     let mirror_dest = temp_dest.path().to_str().unwrap();
 
-    let mirror_config = cmd_mirror::MirrorConfig {
+    let mirror_config = MirrorConfig {
         src: server_url.clone(),
         dst: format!("file://{}", mirror_dest),
         concurrency: 4,
         high: Some(127),
         low: None,
         skip_optional: true,
-        http_connections: 256,
         overwrite: false,
         allow_mirror_gaps: false,
         max_bucket_cache: None,
@@ -872,7 +862,7 @@ async fn test_http_chunked_transfer_encoding() {
 
     println!("Testing mirror with chunked transfer encoding");
 
-    match cmd_mirror::run(mirror_config).await {
+    match run_mirror(mirror_config).await {
         Ok(_) => {
             println!("✓ Mirror succeeded with chunked transfer encoding!");
         }
@@ -898,7 +888,14 @@ async fn test_http_base_url_without_trailing_slash() {
     // Previously, joining paths would replace the last segment instead of appending,
     // causing a 404 when fetching .well-known/stellar-history.json
 
-    use stellar_archivist::io_backend::{BlobStore, HttpStore};
+    use stellar_archivist::storage::{HttpRetryConfig, HttpStore, Storage};
+
+    fn test_retry_config() -> HttpRetryConfig {
+        HttpRetryConfig {
+            max_retries: 3,
+            initial_backoff_ms: 100,
+        }
+    }
 
     let temp_archive = TempDir::new().unwrap();
     let archive_path = temp_archive.path();
@@ -925,11 +922,11 @@ async fn test_http_base_url_without_trailing_slash() {
 
     // Create an HttpStore with the URL without trailing slash
     let url = base_url_no_slash.parse::<reqwest::Url>().unwrap();
-    let store = HttpStore::new(url);
+    let store = HttpStore::new(url, test_retry_config());
 
     // Try to fetch the HAS file - this should work with our fix
     let has_path = ".well-known/stellar-history.json";
-    let result = store.get_reader(has_path).await;
+    let result = store.open_reader(has_path).await;
 
     // The fetch should succeed
     assert!(
@@ -957,7 +954,14 @@ async fn test_http_base_url_without_trailing_slash() {
 #[tokio::test]
 async fn test_http_redirect_tax() {
     // Test that HTTP→HTTPS redirect is handled efficiently
-    use stellar_archivist::io_backend::{BlobStore, HttpStore};
+    use stellar_archivist::storage::{HttpRetryConfig, HttpStore, Storage};
+
+    fn test_retry_config() -> HttpRetryConfig {
+        HttpRetryConfig {
+            max_retries: 3,
+            initial_backoff_ms: 100,
+        }
+    }
 
     // Create a simple test - HttpStore should work with both HTTP and HTTPS
     let temp_dir = TempDir::new().unwrap();
@@ -973,10 +977,10 @@ async fn test_http_redirect_tax() {
 
     // Test that HttpStore works with HTTP URL
     let http_base = reqwest::Url::parse(&format!("{}/", http_url)).unwrap();
-    let store = HttpStore::new(http_base);
+    let store = HttpStore::new(http_base, test_retry_config());
 
     // This should work with HTTP
-    let mut reader = store.get_reader("test.txt").await.unwrap();
+    let mut reader = store.open_reader("test.txt").await.unwrap();
     let mut content = Vec::new();
     tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut content)
         .await
@@ -994,13 +998,20 @@ async fn test_http_redirect_tax() {
 }
 
 #[tokio::test]
-async fn test_http_ranged_downloads() {
-    // Test that HTTP ranged downloads work correctly
+async fn test_http_streaming_from_range_capable_server() {
+    // Test that streaming works correctly from servers that support Range requests
     use axum::{
         http::{header, HeaderMap, StatusCode},
         routing::get,
     };
-    use stellar_archivist::io_backend::{BlobStore, HttpStore};
+    use stellar_archivist::storage::{HttpRetryConfig, HttpStore, Storage};
+
+    fn test_retry_config() -> HttpRetryConfig {
+        HttpRetryConfig {
+            max_retries: 3,
+            initial_backoff_ms: 100,
+        }
+    }
 
     // Create a simple file to serve
     let temp_dir = TempDir::new().unwrap();
@@ -1067,21 +1078,19 @@ async fn test_http_ranged_downloads() {
 
     // Test the HttpStore with ranged requests
     let url = reqwest::Url::parse(&format!("{}/", server_url)).unwrap();
-    let store = HttpStore::new(url);
+    let store = HttpStore::new(url, test_retry_config());
 
-    // Test 1: Full file download
-    let mut reader = store.get_reader("test.bin").await.unwrap();
+    // Test streaming download (even though server supports ranges, we always stream)
+    let mut reader = store.open_reader("test.bin").await.unwrap();
     let mut content = Vec::new();
     tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut content)
         .await
         .unwrap();
-    assert_eq!(content.len(), 10240, "Full download size mismatch");
-    assert_eq!(content, test_data, "Full download content mismatch");
-
-    // Range downloads are no longer supported - we use streaming only
+    assert_eq!(content.len(), 10240, "Streaming download size mismatch");
+    assert_eq!(content, test_data, "Streaming download content mismatch");
 
     server_handle.abort();
-    println!("✓ test_http_ranged_downloads passed");
+    println!("✓ test_http_streaming_from_range_capable_server passed");
 }
 
 // Helper function to copy archive but omit some files to cause download failures
@@ -1127,15 +1136,22 @@ fn copy_archive_with_unreadable_files(src: &std::path::Path, dst: &std::path::Pa
 async fn test_https_client_creation() {
     // Test that HTTPS client creation works correctly
     // This test replicates the issue where HTTPS URLs fail with the new HTTP client builder
-    use stellar_archivist::io_backend::{BlobStore, HttpStore};
+    use stellar_archivist::storage::{HttpRetryConfig, HttpStore, Storage};
+
+    fn test_retry_config() -> HttpRetryConfig {
+        HttpRetryConfig {
+            max_retries: 3,
+            initial_backoff_ms: 100,
+        }
+    }
 
     // Test with a real HTTPS URL (we'll use a small file from the actual Stellar archive)
     let https_url =
         reqwest::Url::parse("https://history.stellar.org/prd/core-live/core_live_001/").unwrap();
-    let store = HttpStore::new(https_url);
+    let store = HttpStore::new(https_url, test_retry_config());
 
     // Try to get the well-known file - this should work with HTTPS
-    match store.get_reader(".well-known/stellar-history.json").await {
+    match store.open_reader(".well-known/stellar-history.json").await {
         Ok(mut reader) => {
             // Read some data to ensure the connection works
             let mut buffer = vec![0u8; 100];

@@ -6,7 +6,7 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::path::{Path, PathBuf};
-use stellar_archivist::cmd_scan;
+use stellar_archivist::test_helpers::{run_scan, ScanConfig};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
@@ -163,16 +163,15 @@ async fn test_scan_missing_bucket_dynamic() {
     }
 
     // Now scan should fail since we removed a bucket
-    let scan_config = cmd_scan::ScanConfig {
+    let scan_config = ScanConfig {
         archive: format!("file://{}", archive_path.to_str().unwrap()),
         concurrency: 8,
         skip_optional: false,
-        http_connections: 256,
         low: None,
         high: None,
     };
 
-    match cmd_scan::run(scan_config).await {
+    match run_scan(scan_config).await {
         Ok(_) => {
             // BUG: The scan passed even though we removed a bucket!
             // This happens because scan only checks buckets from root HAS
@@ -184,8 +183,8 @@ async fn test_scan_missing_bucket_dynamic() {
         Err(e) => {
             println!("✓ Scan correctly failed with error: {}", e);
             assert!(
-                e.to_string().contains("bucket") || e.to_string().contains("Missing"),
-                "Error should mention missing bucket, got: {}",
+                e.to_string().contains("Archive scan failed"),
+                "Error should be 'Archive scan failed', got: {}",
                 e
             );
         }
@@ -218,25 +217,24 @@ async fn test_scan_missing_history() {
         println!("Removed history file: {:?}", removed_file);
     }
 
-    let scan_config = cmd_scan::ScanConfig {
+    let scan_config = ScanConfig {
         archive: format!("file://{}", archive_path.to_str().unwrap()),
         concurrency: 8,
         skip_optional: false,
-        http_connections: 256,
         low: None,
         high: None,
     };
 
     // Scan should detect missing history file
-    match cmd_scan::run(scan_config).await {
+    match run_scan(scan_config).await {
         Ok(_) => {
             println!("Scan completed, likely only warned about missing files");
         }
         Err(e) => {
             println!("✓ Scan failed with error: {}", e);
             assert!(
-                e.to_string().contains("required files missing"),
-                "Error should mention missing required files, got: {}",
+                e.to_string().contains("Archive scan failed"),
+                "Error should be 'Archive scan failed', got: {}",
                 e
             );
         }
@@ -264,25 +262,24 @@ async fn test_scan_missing_ledger() {
         println!("Removed ledger file: {:?}", removed_file);
     }
 
-    let scan_config = cmd_scan::ScanConfig {
+    let scan_config = ScanConfig {
         archive: format!("file://{}", archive_path.to_str().unwrap()),
         concurrency: 8,
         skip_optional: false,
-        http_connections: 256,
         low: None,
         high: None,
     };
 
     // Scan should detect missing ledger file
-    match cmd_scan::run(scan_config).await {
+    match run_scan(scan_config).await {
         Ok(_) => {
             println!("Scan completed, likely only warned about missing files");
         }
         Err(e) => {
             println!("✓ Scan failed with error: {}", e);
             assert!(
-                e.to_string().contains("required files missing"),
-                "Error should mention missing required files, got: {}",
+                e.to_string().contains("Archive scan failed"),
+                "Error should be 'Archive scan failed', got: {}",
                 e
             );
         }
@@ -310,25 +307,24 @@ async fn test_scan_missing_transactions() {
         println!("Removed transaction file: {:?}", removed_file);
     }
 
-    let scan_config = cmd_scan::ScanConfig {
+    let scan_config = ScanConfig {
         archive: format!("file://{}", archive_path.to_str().unwrap()),
         concurrency: 8,
         skip_optional: false,
-        http_connections: 256,
         low: None,
         high: None,
     };
 
     // Scan should detect missing transaction file
-    match cmd_scan::run(scan_config).await {
+    match run_scan(scan_config).await {
         Ok(_) => {
             println!("Scan completed, likely only warned about missing files");
         }
         Err(e) => {
             println!("✓ Scan failed with error: {}", e);
             assert!(
-                e.to_string().contains("required files missing"),
-                "Error should mention missing required files, got: {}",
+                e.to_string().contains("Archive scan failed"),
+                "Error should be 'Archive scan failed', got: {}",
                 e
             );
         }
@@ -356,25 +352,24 @@ async fn test_scan_missing_results() {
         println!("Removed results file: {:?}", removed_file);
     }
 
-    let scan_config = cmd_scan::ScanConfig {
+    let scan_config = ScanConfig {
         archive: format!("file://{}", archive_path.to_str().unwrap()),
         concurrency: 8,
         skip_optional: false,
-        http_connections: 256,
         low: None,
         high: None,
     };
 
     // Scan should detect missing results file
-    match cmd_scan::run(scan_config).await {
+    match run_scan(scan_config).await {
         Ok(_) => {
             println!("Scan completed, likely only warned about missing files");
         }
         Err(e) => {
             println!("✓ Scan failed with error: {}", e);
             assert!(
-                e.to_string().contains("required files missing"),
-                "Error should mention missing required files, got: {}",
+                e.to_string().contains("Archive scan failed"),
+                "Error should be 'Archive scan failed', got: {}",
                 e
             );
         }
@@ -393,17 +388,16 @@ async fn test_scan_complete_archive() {
     copy_test_archive(archive_path).expect("Failed to copy test archive");
 
     // Don't remove anything - archive should be complete
-    let scan_config = cmd_scan::ScanConfig {
+    let scan_config = ScanConfig {
         archive: format!("file://{}", archive_path.to_str().unwrap()),
         concurrency: 8,
         skip_optional: false,
-        http_connections: 256,
         low: None,
         high: None,
     };
 
     // Scan should succeed on complete archive
-    match cmd_scan::run(scan_config).await {
+    match run_scan(scan_config).await {
         Ok(_) => {
             println!("✓ Scan succeeded on complete archive");
         }
@@ -533,16 +527,15 @@ async fn test_scan_detects_all_historical_buckets() {
 
     // Now scan - with the bug, this will PASS because scan only checks root HAS buckets
     // After the fix, this should FAIL
-    let scan_config = cmd_scan::ScanConfig {
+    let scan_config = ScanConfig {
         archive: format!("file://{}", archive_path.to_str().unwrap()),
         concurrency: 8,
         skip_optional: false,
-        http_connections: 256,
         low: None,
         high: None,
     };
 
-    match cmd_scan::run(scan_config).await {
+    match run_scan(scan_config).await {
         Ok(_) => {
             println!("BUG CONFIRMED: Scan passed despite missing historical bucket!");
             println!("The scan is only checking buckets from root HAS, not all history files.");
@@ -552,8 +545,8 @@ async fn test_scan_detects_all_historical_buckets() {
         Err(e) => {
             println!("✓ Scan correctly detected missing historical bucket: {}", e);
             assert!(
-                e.to_string().contains("bucket") || e.to_string().contains("Missing"),
-                "Error should mention missing bucket, got: {}",
+                e.to_string().contains("Archive scan failed"),
+                "Error should be 'Archive scan failed', got: {}",
                 e
             );
         }
@@ -580,26 +573,26 @@ async fn test_scan_missing_well_known() {
     println!("Removed .well-known/stellar-history.json");
 
     // Scan should fail without the root HAS file
-    let scan_config = cmd_scan::ScanConfig {
+    let scan_config = ScanConfig {
         archive: format!("file://{}", archive_path.to_str().unwrap()),
         concurrency: 8,
         skip_optional: false,
-        http_connections: 256,
         low: None,
         high: None,
     };
 
-    match cmd_scan::run(scan_config).await {
+    match run_scan(scan_config).await {
         Ok(_) => {
             panic!("Scan should fail when .well-known/stellar-history.json is missing!");
         }
         Err(e) => {
             println!("✓ Scan correctly failed with error: {}", e);
             assert!(
-                e.to_string().contains("stellar-history.json")
+                e.to_string().contains("Archive scan failed")
+                    || e.to_string().contains("stellar-history.json")
                     || e.to_string().contains("not found")
                     || e.to_string().contains("Failed to fetch"),
-                "Error should mention missing HAS file, got: {}",
+                "Error should be 'Archive scan failed' or HAS-related error, got: {}",
                 e
             );
         }
@@ -651,16 +644,15 @@ async fn test_scan_well_known_not_in_history() {
     }
 
     // Scan should detect this inconsistency
-    let scan_config = cmd_scan::ScanConfig {
+    let scan_config = ScanConfig {
         archive: format!("file://{}", archive_path.to_str().unwrap()),
         concurrency: 8,
         skip_optional: false,
-        http_connections: 256,
         low: None,
         high: None,
     };
 
-    match cmd_scan::run(scan_config).await {
+    match run_scan(scan_config).await {
         Ok(_) => {
             // The scan might pass if it only looks at .well-known
             println!("Scan passed - it may not check for history file consistency");
@@ -668,10 +660,8 @@ async fn test_scan_well_known_not_in_history() {
         Err(e) => {
             println!("✓ Scan detected missing history file: {}", e);
             assert!(
-                e.to_string().contains("missing")
-                    || e.to_string().contains("Missing")
-                    || e.to_string().contains("history"),
-                "Error should mention missing file, got: {}",
+                e.to_string().contains("Archive scan failed"),
+                "Error should be 'Archive scan failed', got: {}",
                 e
             );
         }

@@ -58,7 +58,7 @@ pub const ROOT_HAS_PATH: &str = ".well-known/stellar-history.json";
 
 // Root HAS structure describing archive state at a checkpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HistoryArchiveState {
+pub struct HistoryFileState {
     pub version: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
@@ -95,7 +95,7 @@ pub struct NextState {
     pub shadow: Option<Vec<String>>,
 }
 
-impl HistoryArchiveState {
+impl HistoryFileState {
     // Helper function to validate a single bucket level
     fn validate_bucket_level(
         level: &BucketLevel,
@@ -404,7 +404,7 @@ pub fn checkpoint_path_typed(category: FileCategory, checkpoint: u32) -> String 
 }
 
 // List all required archive files (excluding optional scp)
-pub fn enumerate_all_files(has: &HistoryArchiveState) -> Vec<String> {
+pub fn enumerate_all_files(has: &HistoryFileState) -> Vec<String> {
     let mut files = Vec::new();
 
     // Add root HAS
@@ -430,7 +430,7 @@ pub fn enumerate_all_files(has: &HistoryArchiveState) -> Vec<String> {
 }
 
 // List all archive files including optional scp
-pub fn enumerate_all_files_with_optional(has: &HistoryArchiveState) -> Vec<String> {
+pub fn enumerate_all_files_with_optional(has: &HistoryFileState) -> Vec<String> {
     let mut files = enumerate_all_files(has);
 
     let checkpoints = has.get_checkpoint_range();
@@ -443,10 +443,7 @@ pub fn enumerate_all_files_with_optional(has: &HistoryArchiveState) -> Vec<Strin
 }
 
 // List all checkpoint files for the given HAS (without buckets or root HAS)
-pub fn enumerate_checkpoint_files(
-    has: &HistoryArchiveState,
-    include_optional: bool,
-) -> Vec<String> {
+pub fn enumerate_checkpoint_files(has: &HistoryFileState, include_optional: bool) -> Vec<String> {
     let mut files = Vec::new();
     let checkpoints = has.get_checkpoint_range();
 
@@ -467,7 +464,7 @@ pub fn enumerate_checkpoint_files(
 
 /// Generate list of files for a specific checkpoint
 pub fn enumerate_checkpoint_files_for(
-    _has: &HistoryArchiveState,
+    _has: &HistoryFileState,
     checkpoint: u32,
     include_optional: bool,
 ) -> Vec<String> {

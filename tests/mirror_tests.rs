@@ -2,7 +2,10 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use stellar_archivist::{cmd_mirror, cmd_scan, history_archive};
+use stellar_archivist::{
+    history_file,
+    test_helpers::{run_mirror, run_scan, MirrorConfig, ScanConfig},
+};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
@@ -30,7 +33,7 @@ fn verify_mirror_correctness(source_path: &Path, dest_path: &Path, max_checkpoin
         // For history files within bounds, parse and collect bucket hashes
         if path_str.contains("history-") && path_str.ends_with(".json") {
             let filename = src_file.file_name().unwrap().to_string_lossy();
-            let checkpoint = history_archive::checkpoint_from_filename(&filename).expect(&format!(
+            let checkpoint = history_file::checkpoint_from_filename(&filename).expect(&format!(
                 "Failed to extract checkpoint from history filename: {}",
                 filename
             ));
@@ -45,7 +48,7 @@ fn verify_mirror_correctness(source_path: &Path, dest_path: &Path, max_checkpoin
             // Parse the history file to get referenced bucket hashes
             let content = std::fs::read_to_string(&src_file)
                 .expect(&format!("Failed to read history file: {:?}", src_file));
-            let has: history_archive::HistoryArchiveState = serde_json::from_str(&content)
+            let has: history_file::HistoryFileState = serde_json::from_str(&content)
                 .expect(&format!("Failed to parse history file: {:?}", src_file));
             for hash in has.buckets() {
                 expected_bucket_hashes.insert(hash);
@@ -66,7 +69,7 @@ fn verify_mirror_correctness(source_path: &Path, dest_path: &Path, max_checkpoin
                 {
                     let filename = src_file.file_name().unwrap().to_string_lossy();
                     let checkpoint =
-                        history_archive::checkpoint_from_filename(&filename).expect(&format!(
+                        history_file::checkpoint_from_filename(&filename).expect(&format!(
                             "Failed to extract checkpoint from history filename: {}",
                             filename
                         ));
@@ -126,7 +129,7 @@ fn verify_mirror_correctness(source_path: &Path, dest_path: &Path, max_checkpoin
         // Check that the bucket file is actually reference by something in bounds
         if path_str.starts_with("bucket/") {
             let filename = dst_file.file_name().unwrap().to_string_lossy();
-            let hash = history_archive::bucket_hash_from_filename(&filename).expect(&format!(
+            let hash = history_file::bucket_hash_from_filename(&filename).expect(&format!(
                 "Failed to extract bucket hash from filename: {}",
                 filename
             ));
@@ -147,7 +150,7 @@ fn verify_mirror_correctness(source_path: &Path, dest_path: &Path, max_checkpoin
                 || path_str.contains("scp-")
             {
                 let filename = dst_file.file_name().unwrap().to_string_lossy();
-                if let Some(checkpoint) = history_archive::checkpoint_from_filename(&filename) {
+                if let Some(checkpoint) = history_file::checkpoint_from_filename(&filename) {
                     assert!(
                         checkpoint <= max_cp,
                         "Found file beyond bound: {} (checkpoint 0x{:08x} > 0x{:08x})",
@@ -198,12 +201,11 @@ async fn test_mirror_and_scan_roundtrip() {
     let temp_dir1 = TempDir::new().expect("Failed to create temp dir");
     let mirror_dest1 = temp_dir1.path().to_str().unwrap();
 
-    let mirror_config = cmd_mirror::MirrorConfig {
+    let mirror_config = MirrorConfig {
         src: format!("file://{}", test_archive_path.to_str().unwrap()),
         dst: format!("file://{}", mirror_dest1),
         concurrency: 4,
         skip_optional: false,
-        http_connections: 256,
         high: None,
         low: None,
         overwrite: false,
@@ -211,21 +213,18 @@ async fn test_mirror_and_scan_roundtrip() {
         max_bucket_cache: None,
     };
 
-    cmd_mirror::run(mirror_config)
-        .await
-        .expect("Full mirror failed");
+    run_mirror(mirror_config).await.expect("Full mirror failed");
 
     // Scan the fully mirrored archive
-    let scan_config = cmd_scan::ScanConfig {
+    let scan_config = ScanConfig {
         archive: format!("file://{}", mirror_dest1),
         concurrency: 4,
         skip_optional: false,
-        http_connections: 256,
         low: None,
         high: None,
     };
 
-    cmd_scan::run(scan_config)
+    run_scan(scan_config)
         .await
         .expect("Scan of full archive failed");
     println!("✓ Test Case 1 passed: Full archive mirror and scan");
@@ -234,12 +233,11 @@ async fn test_mirror_and_scan_roundtrip() {
     let temp_dir2 = TempDir::new().expect("Failed to create temp dir");
     let mirror_dest2 = temp_dir2.path().to_str().unwrap();
 
-    let mirror_config = cmd_mirror::MirrorConfig {
+    let mirror_config = MirrorConfig {
         src: format!("file://{}", test_archive_path.to_str().unwrap()),
         dst: format!("file://{}", mirror_dest2),
         concurrency: 4,
         skip_optional: false,
-        http_connections: 256,
         high: Some(4991),
         low: None,
         overwrite: false,
@@ -247,20 +245,19 @@ async fn test_mirror_and_scan_roundtrip() {
         max_bucket_cache: None,
     };
 
-    cmd_mirror::run(mirror_config)
+    run_mirror(mirror_config)
         .await
         .expect("Bounded mirror failed");
 
-    let scan_config = cmd_scan::ScanConfig {
+    let scan_config = ScanConfig {
         archive: format!("file://{}", mirror_dest2),
         concurrency: 4,
         skip_optional: false,
-        http_connections: 256,
         low: None,
         high: None,
     };
 
-    cmd_scan::run(scan_config)
+    run_scan(scan_config)
         .await
         .expect("Scan should succeed with properly updated HAS");
     println!("✓ Test Case 2 passed: Mirror with upper bound");
@@ -269,12 +266,11 @@ async fn test_mirror_and_scan_roundtrip() {
     let temp_dir3 = TempDir::new().expect("Failed to create temp dir");
     let mirror_dest3 = temp_dir3.path().to_str().unwrap();
 
-    let mirror_config = cmd_mirror::MirrorConfig {
+    let mirror_config = MirrorConfig {
         src: format!("file://{}", test_archive_path.to_str().unwrap()),
         dst: format!("file://{}", mirror_dest3),
         concurrency: 4,
         skip_optional: true,
-        http_connections: 256,
         high: None,
         low: None,
         overwrite: false,
@@ -282,7 +278,7 @@ async fn test_mirror_and_scan_roundtrip() {
         max_bucket_cache: None,
     };
 
-    cmd_mirror::run(mirror_config)
+    run_mirror(mirror_config)
         .await
         .expect("Mirror with skip_optional failed");
 
@@ -294,16 +290,15 @@ async fn test_mirror_and_scan_roundtrip() {
         scp_dir
     );
 
-    let scan_config = cmd_scan::ScanConfig {
+    let scan_config = ScanConfig {
         archive: format!("file://{}", mirror_dest3),
         concurrency: 4,
         skip_optional: true,
-        http_connections: 256,
         low: None,
         high: None,
     };
 
-    cmd_scan::run(scan_config)
+    run_scan(scan_config)
         .await
         .expect("Scan of archive without optional files failed");
 
@@ -321,12 +316,11 @@ async fn test_mirror() {
     let mirror_dest = temp_dir.path().to_str().unwrap();
 
     // Mirror with high concurrency
-    let mirror_config = cmd_mirror::MirrorConfig {
+    let mirror_config = MirrorConfig {
         src: format!("file://{}", test_archive_path.to_str().unwrap()),
         dst: format!("file://{}", mirror_dest),
         concurrency: 20,
         skip_optional: false,
-        http_connections: 256,
         high: None,
         low: None,
         overwrite: false,
@@ -334,7 +328,7 @@ async fn test_mirror() {
         max_bucket_cache: None,
     };
 
-    cmd_mirror::run(mirror_config)
+    run_mirror(mirror_config)
         .await
         .expect("Mirror with high concurrency failed");
 
@@ -364,12 +358,11 @@ async fn test_mirror() {
     let temp_dir2 = TempDir::new().expect("Failed to create temp dir");
     let mirror_dest2 = temp_dir2.path().to_str().unwrap();
 
-    let mirror_config = cmd_mirror::MirrorConfig {
+    let mirror_config = MirrorConfig {
         src: format!("file://{}", test_archive_path.to_str().unwrap()),
         dst: format!("file://{}", mirror_dest2),
         concurrency: 20,
         skip_optional: false,
-        http_connections: 256,
         high: Some(4991),
         low: None,
         overwrite: false,
@@ -377,7 +370,7 @@ async fn test_mirror() {
         max_bucket_cache: None,
     };
 
-    cmd_mirror::run(mirror_config)
+    run_mirror(mirror_config)
         .await
         .expect("Bounded mirror failed");
 

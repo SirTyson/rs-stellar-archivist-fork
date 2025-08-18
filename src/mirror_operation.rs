@@ -1,102 +1,53 @@
-//! Simplified mirror operation - only handles file copying
+//! Mirror operation - copies files from source to destination
 
-use crate::fetcher::{exists, read_file, write_file, StorageRef as Storage};
-use crate::history_archive;
-use crate::pipeline::{async_trait, ArchiveOperation, Pipeline, ProcessResult};
+use crate::history_file;
+use crate::pipeline::{async_trait, Operation, ReaderResult};
+use crate::storage::WRITE_BUF_BYTES;
+use crate::utils::ArchiveStats;
 use anyhow::Result;
-use parking_lot::RwLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 pub struct MirrorOperation {
-    // Source and destination operators
-    src_op: Storage,
-    dst_op: Storage,
-    pipeline: RwLock<Option<Arc<Pipeline<MirrorOperation>>>>,
+    dst_op: crate::utils::StorageRef,
     overwrite: bool,
-    // Tracking
-    total_files: Arc<AtomicUsize>,
-    failed_files: Arc<AtomicUsize>,
-    skipped_files: Arc<AtomicUsize>,
+    stats: ArchiveStats,
 }
 
 impl MirrorOperation {
-    /// Create a new mirror operation
-    pub async fn new(src: &str, dst: &str, overwrite: bool) -> Result<Self> {
-        Self::new_with_concurrency(src, dst, overwrite, 256).await
-    }
+    pub async fn new(dst: &str, overwrite: bool) -> Result<Self> {
+        let dst_op = crate::storage::StorageBackend::from_url(dst, None).await?;
 
-    /// Create a new mirror operation with custom HTTP concurrency
-    pub async fn new_with_concurrency(
-        src: &str,
-        dst: &str,
-        overwrite: bool,
-        http_connections: usize,
-    ) -> Result<Self> {
-        let src_op = crate::fetcher::new_operator_with_concurrency(src, http_connections).await?;
-        let dst_op = crate::fetcher::new_operator_with_concurrency(dst, http_connections).await?;
-
-        // Validate destination is filesystem
+        // Destination must be a filesystem
         if !dst.starts_with("file://") {
             anyhow::bail!("Destination must be a filesystem path (file://...)");
         }
 
         Ok(Self {
-            src_op,
             dst_op,
-            pipeline: RwLock::new(None),
             overwrite,
-            total_files: Arc::new(AtomicUsize::new(0)),
-            failed_files: Arc::new(AtomicUsize::new(0)),
-            skipped_files: Arc::new(AtomicUsize::new(0)),
+            stats: ArchiveStats::new(),
         })
     }
 
-    /// Get the source storage operator
-    pub fn source_storage(&self) -> &Storage {
-        &self.src_op
-    }
+    /// Get the destination's latest checkpoint from its HAS file
+    pub async fn get_latest_dest_checkpoint(&self) -> Result<u32> {
+        use crate::utils::fetch_history_archive_state;
 
-    /// Get the destination's current checkpoint from its HAS file if it exists
-    pub async fn get_destination_checkpoint(&self) -> Result<Option<u32>> {
-        use crate::fetcher::fetch_history_archive_state;
-
-        // Try to read the destination's HAS file
-        match fetch_history_archive_state(&self.dst_op).await {
-            Ok(has) => {
-                // Return the current ledger from the destination's HAS
-                Ok(Some(has.current_ledger))
-            }
-            Err(_) => {
-                // No HAS file or couldn't read it - destination is empty or invalid
-                Ok(None)
-            }
-        }
-    }
-
-    /// Set the pipeline reference (called by Pipeline after creation)
-    pub fn set_pipeline(&self, pipeline: Arc<Pipeline<MirrorOperation>>) {
-        *self.pipeline.write() = Some(pipeline);
-    }
-
-    /// Copy a file from source to destination
-    async fn copy_file_impl(&self, path: &str) -> Result<()> {
-        crate::fetcher::copy_file(&self.src_op, &self.dst_op, path).await?;
-        debug!("Copied: {}", path);
-        Ok(())
+        // Read the destination's HAS file - error if it doesn't exist
+        let has = fetch_history_archive_state(&self.dst_op).await?;
+        Ok(has.current_ledger)
     }
 
     /// Update the HAS file to destination if needed
-    async fn update_has_if_needed(&self, highest_checkpoint: u32) -> Result<()> {
+    async fn maybe_update_has(&self, highest_checkpoint: u32) -> Result<()> {
         // Check if we should update the HAS file
         // We should only update if:
         // 1. There's no existing HAS file, OR
         // 2. The new checkpoint is higher than the existing HAS
 
-        let should_update = match self.get_destination_checkpoint().await {
-            Ok(Some(existing_ledger)) => {
-                let existing_checkpoint = history_archive::checkpoint_number(existing_ledger);
+        let should_update = match self.get_latest_dest_checkpoint().await {
+            Ok(existing_ledger) => {
+                let existing_checkpoint = history_file::checkpoint_number(existing_ledger);
                 if highest_checkpoint > existing_checkpoint {
                     info!(
                         "Updating HAS from checkpoint {:08x} to {:08x}",
@@ -111,16 +62,10 @@ impl MirrorOperation {
                     false
                 }
             }
-            Ok(None) => {
+            Err(_) => {
+                // No existing HAS file - create a new one
                 info!(
                     "No existing HAS, creating new one at checkpoint {:08x}",
-                    highest_checkpoint
-                );
-                true
-            }
-            Err(_) => {
-                info!(
-                    "Could not read existing HAS, creating new one at checkpoint {:08x}",
                     highest_checkpoint
                 );
                 true
@@ -129,16 +74,39 @@ impl MirrorOperation {
 
         if should_update {
             // Copy the history file at the specified checkpoint to be our HAS file
-            let history_path = history_archive::checkpoint_path("history", highest_checkpoint);
+            let history_path = history_file::checkpoint_path("history", highest_checkpoint);
 
             // IMPORTANT: Read the history file from DESTINATION, not source!
             // The source may have advanced since we started mirroring.
             // We want the HAS to reflect what we actually mirrored.
-            let history_content = read_file(&self.dst_op, &history_path).await?;
+            use tokio::io::AsyncReadExt;
+            let mut reader = self
+                .dst_op
+                .open_reader(&history_path)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to read history file: {}", e))?;
+            let mut history_content = Vec::new();
+            reader
+                .read_to_end(&mut history_content)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to read history content: {}", e))?;
 
             // Write it as the .well-known/stellar-history.json
             let has_path = ".well-known/stellar-history.json";
-            write_file(&self.dst_op, has_path, history_content).await?;
+            let mut writer = self
+                .dst_op
+                .open_writer(has_path)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to open HAS file for writing: {}", e))?;
+            use tokio::io::AsyncWriteExt;
+            writer
+                .write_all(&history_content)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to write HAS file: {}", e))?;
+            writer
+                .flush()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to flush HAS file: {}", e))?;
 
             info!(
                 "Updated destination HAS to checkpoint {:08x}",
@@ -151,84 +119,87 @@ impl MirrorOperation {
 }
 
 #[async_trait]
-impl ArchiveOperation for MirrorOperation {
-    async fn process_file(&self, path: &str, is_optional: bool) -> Result<ProcessResult> {
-        // With overwrite mode, we overwrite files within the mirrored range
-        // Without overwrite mode, we skip existing files
-        if !self.overwrite {
-            if exists(&self.dst_op, path).await? {
-                debug!("Skipping existing file: {}", path);
-                self.skipped_files.fetch_add(1, Ordering::Relaxed);
-                return Ok(ProcessResult::Skipped);
+impl Operation for MirrorOperation {
+    async fn process_object(&self, path: &str, reader_result: ReaderResult) {
+        // Handle case where we couldn't get a reader (source file missing/inaccessible)
+        let mut reader = match reader_result {
+            ReaderResult::Ok(r) => r,
+            ReaderResult::Err(e) => {
+                // Source file couldn't be read - count as failure
+                error!("Failed to read source file {}: {}", path, e);
+                self.stats
+                    .record_failure(path, &format!("Source read error: {}", e))
+                    .await;
+                return;
             }
-        } else {
-            // In overwrite mode, we re-download files that are within the range
-            // Files outside the range are preserved (this is handled by the pipeline)
-            if exists(&self.dst_op, path).await? {
-                debug!("Overwriting existing file: {}", path);
+        };
+        // Check if file exists and handle based on overwrite mode
+        match self.dst_op.exists(path).await {
+            Ok(true) => {
+                if !self.overwrite {
+                    debug!("Skipping existing file: {}", path);
+                    self.stats.record_skipped(path);
+                    return;
+                } else {
+                    // Proceed with overwrite
+                    debug!("Overwriting existing file: {}", path);
+                }
             }
-        }
-
-        // Copy the file
-        match self.copy_file_impl(path).await {
-            Ok(_) => {
-                self.total_files.fetch_add(1, Ordering::Relaxed);
-                Ok(ProcessResult::Success)
+            Ok(false) => {
+                // File doesn't exist, proceed with download
             }
             Err(e) => {
-                if is_optional {
-                    warn!("Failed to copy optional file {}: {}", path, e);
-                    self.skipped_files.fetch_add(1, Ordering::Relaxed);
-                    Ok(ProcessResult::Skipped)
-                } else {
-                    error!("Failed to copy required file {}: {}", path, e);
-                    self.failed_files.fetch_add(1, Ordering::Relaxed);
-                    Ok(ProcessResult::Failed(e.to_string()))
-                }
+                // Failed to check existence - treat as error
+                error!("Failed to check existence of file {}: {}", path, e);
+                self.stats
+                    .record_failure(path, &format!("Existence check failed: {}", e))
+                    .await;
+                return;
             }
         }
-    }
 
-    async fn handle_result(&self, path: &str, result: &ProcessResult) -> Result<()> {
-        match result {
-            ProcessResult::Success => {
+        use tokio::io::{AsyncWriteExt, BufWriter};
+
+        // Stream from source to destination
+        let write_result = async {
+            let writer = self.dst_op.open_writer(path).await?;
+            let mut buf_writer = BufWriter::with_capacity(WRITE_BUF_BYTES, writer);
+            tokio::io::copy(&mut reader, &mut buf_writer).await?;
+            buf_writer.flush().await?;
+            Ok::<(), std::io::Error>(())
+        }
+        .await;
+
+        match write_result {
+            Ok(_) => {
                 debug!("Successfully copied: {}", path);
+                self.stats.record_success(path);
             }
-            ProcessResult::Failed(err) => {
-                error!("Failed to copy {}: {}", path, err);
-            }
-            ProcessResult::Skipped => {
-                debug!("Skipped: {}", path);
+            Err(e) => {
+                error!("Failed to write file {}: {}", path, e);
+                self.stats
+                    .record_failure(path, &format!("Write error: {}", e))
+                    .await;
             }
         }
-        Ok(())
     }
 
-    async fn finalize(&self) -> Result<()> {
-        let total = self.total_files.load(Ordering::Relaxed);
-        let failed = self.failed_files.load(Ordering::Relaxed);
-        let skipped = self.skipped_files.load(Ordering::Relaxed);
+    async fn finalize(&self, highest_checkpoint: Option<u32>) -> Result<()> {
+        // Generate and log complete report
+        self.stats.report("mirror").await;
 
-        info!(
-            "Mirror completed: {} files copied, {} failed, {} skipped",
-            total, failed, skipped
-        );
-
-        // Get the highest checkpoint from the pipeline
-        let pipeline_ref = self.pipeline.read().clone();
-        if let Some(ref pipeline) = pipeline_ref {
-            if let Some(highest) = pipeline.get_highest_checkpoint().await {
-                // Update HAS file if needed (only if we're advancing it)
-                if let Err(e) = self.update_has_if_needed(highest).await {
-                    error!("Failed to update HAS file: {}", e);
-                    return Err(e);
-                }
+        // Update HAS file if we processed any checkpoints
+        if let Some(highest) = highest_checkpoint {
+            // Update HAS file if needed (only if we're advancing it)
+            if let Err(e) = self.maybe_update_has(highest).await {
+                error!("Failed to update HAS file: {}", e);
+                return Err(e);
             }
         }
 
-        let total_failed = self.failed_files.load(Ordering::Relaxed);
-        if total_failed > 0 {
-            anyhow::bail!("Mirror completed with {} failures", total_failed);
+        // Report failure if there were any failed files
+        if self.stats.has_failures() {
+            anyhow::bail!("Archive mirror failed");
         }
 
         Ok(())

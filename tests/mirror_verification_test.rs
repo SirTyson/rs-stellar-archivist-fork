@@ -1,4 +1,4 @@
-//! Integration tests for mirror command using filesystem operations
+//! Correctness tests for mirror command using filesystem operations
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -143,12 +143,7 @@ fn verify_mirror_correctness(source_path: &Path, dest_path: &Path, max_checkpoin
 
         // For checkpoint files, verify they're within bounds if max_checkpoint is set
         if let Some(max_cp) = max_checkpoint {
-            if path_str.contains("history-")
-                || path_str.contains("ledger-")
-                || path_str.contains("results-")
-                || path_str.contains("transactions-")
-                || path_str.contains("scp-")
-            {
+            if !path_str.starts_with("bucket/") {
                 let filename = dst_file.file_name().unwrap().to_string_lossy();
                 if let Some(checkpoint) = history_file::checkpoint_from_filename(&filename) {
                     assert!(
@@ -197,7 +192,6 @@ async fn test_mirror_and_scan_roundtrip() {
         .join("testdata")
         .join("testnet-archive-small");
 
-    println!("Test Case 1: Mirror and scan entire archive");
     let temp_dir1 = TempDir::new().expect("Failed to create temp dir");
     let mirror_dest1 = temp_dir1.path().to_str().unwrap();
 
@@ -210,7 +204,6 @@ async fn test_mirror_and_scan_roundtrip() {
         low: None,
         overwrite: false,
         allow_mirror_gaps: false,
-        max_bucket_cache: None,
     };
 
     run_mirror(mirror_config).await.expect("Full mirror failed");
@@ -227,9 +220,7 @@ async fn test_mirror_and_scan_roundtrip() {
     run_scan(scan_config)
         .await
         .expect("Scan of full archive failed");
-    println!("✓ Test Case 1 passed: Full archive mirror and scan");
 
-    println!("Test Case 2: Mirror with upper bound");
     let temp_dir2 = TempDir::new().expect("Failed to create temp dir");
     let mirror_dest2 = temp_dir2.path().to_str().unwrap();
 
@@ -242,7 +233,6 @@ async fn test_mirror_and_scan_roundtrip() {
         low: None,
         overwrite: false,
         allow_mirror_gaps: false,
-        max_bucket_cache: None,
     };
 
     run_mirror(mirror_config)
@@ -257,12 +247,8 @@ async fn test_mirror_and_scan_roundtrip() {
         high: None,
     };
 
-    run_scan(scan_config)
-        .await
-        .expect("Scan should succeed with properly updated HAS");
-    println!("✓ Test Case 2 passed: Mirror with upper bound");
+    run_scan(scan_config).await.unwrap();
 
-    println!("Test Case 3: Mirror with skip_optional=true");
     let temp_dir3 = TempDir::new().expect("Failed to create temp dir");
     let mirror_dest3 = temp_dir3.path().to_str().unwrap();
 
@@ -275,7 +261,6 @@ async fn test_mirror_and_scan_roundtrip() {
         low: None,
         overwrite: false,
         allow_mirror_gaps: false,
-        max_bucket_cache: None,
     };
 
     run_mirror(mirror_config)
@@ -284,11 +269,7 @@ async fn test_mirror_and_scan_roundtrip() {
 
     // Verify that the scp directory doesn't exist
     let scp_dir = temp_dir3.path().join("scp");
-    assert!(
-        !scp_dir.exists(),
-        "SCP directory should not exist when skip_optional=true, but it exists at {:?}",
-        scp_dir
-    );
+    assert!(!scp_dir.exists());
 
     let scan_config = ScanConfig {
         archive: format!("file://{}", mirror_dest3),
@@ -301,8 +282,6 @@ async fn test_mirror_and_scan_roundtrip() {
     run_scan(scan_config)
         .await
         .expect("Scan of archive without optional files failed");
-
-    println!("✓ Test Case 3 passed: Mirror and scan with skip_optional=true");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
@@ -311,7 +290,6 @@ async fn test_mirror() {
         .join("testdata")
         .join("testnet-archive-small");
 
-    println!("Test Case 1: Mirror entire archive");
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let mirror_dest = temp_dir.path().to_str().unwrap();
 
@@ -325,7 +303,6 @@ async fn test_mirror() {
         low: None,
         overwrite: false,
         allow_mirror_gaps: false,
-        max_bucket_cache: None,
     };
 
     run_mirror(mirror_config)
@@ -350,11 +327,8 @@ async fn test_mirror() {
     let dst_json: serde_json::Value =
         serde_json::from_slice(&dst_content).expect("Failed to parse dest HAS");
 
-    assert_eq!(src_json, dst_json, "HAS file JSON content mismatch");
+    assert_eq!(src_json, dst_json);
 
-    println!("✓ Test Case 1 passed: Full archive mirror verified");
-
-    println!("Test Case 2: Mirror with upper bound");
     let temp_dir2 = TempDir::new().expect("Failed to create temp dir");
     let mirror_dest2 = temp_dir2.path().to_str().unwrap();
 
@@ -367,7 +341,6 @@ async fn test_mirror() {
         low: None,
         overwrite: false,
         allow_mirror_gaps: false,
-        max_bucket_cache: None,
     };
 
     run_mirror(mirror_config)
@@ -381,10 +354,7 @@ async fn test_mirror() {
     let history_path = test_archive_path.join("history/00/00/13/history-0000137f.json");
     let history_content = std::fs::read(&history_path).expect("Failed to read source history file");
 
-    assert_eq!(
-        has_content, history_content,
-        "HAS file should be byte-for-byte copy of history checkpoint 4991"
-    );
+    assert_eq!(has_content, history_content);
 
     // Use helper to verify bounded mirror
     verify_mirror_correctness(
@@ -392,6 +362,4 @@ async fn test_mirror() {
         temp_dir2.path(),
         Some(0x137f), // Max checkpoint 4991
     );
-
-    println!("✓ Test Case 2 passed: Bounded mirror with correct HAS file and file boundaries");
 }

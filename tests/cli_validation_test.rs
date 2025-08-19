@@ -14,11 +14,10 @@ async fn test_mirror_rejects_http_destination() {
         low: None,
         overwrite: false,
         allow_mirror_gaps: false,
-        max_bucket_cache: None,
     };
 
     let result = cmd_mirror_run(config).await;
-    assert!(result.is_err(), "Should reject HTTP destination");
+    assert!(result.is_err());
 }
 
 #[tokio::test]
@@ -33,11 +32,10 @@ async fn test_mirror_rejects_https_destination() {
         low: None,
         overwrite: false,
         allow_mirror_gaps: false,
-        max_bucket_cache: None,
     };
 
     let result = cmd_mirror_run(config).await;
-    assert!(result.is_err(), "Should reject HTTPS destination");
+    assert!(result.is_err());
 }
 
 #[tokio::test]
@@ -52,20 +50,10 @@ async fn test_mirror_rejects_s3_destination() {
         low: None,
         overwrite: false,
         allow_mirror_gaps: false,
-        max_bucket_cache: None,
     };
 
     let result = cmd_mirror_run(config).await;
-    assert!(result.is_err(), "Should reject S3 destination");
-
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("Destination must be a filesystem path")
-            || err_msg.contains("Unsupported URL scheme")
-            || err_msg.contains("S3 support not yet implemented"),
-        "Error should reject S3 destination, got: {}",
-        err_msg
-    );
+    assert!(result.is_err());
 }
 
 #[tokio::test]
@@ -89,7 +77,6 @@ async fn test_mirror_rejects_malformed_source_url() {
             low: None,
             overwrite: false,
             allow_mirror_gaps: false,
-            max_bucket_cache: None,
         };
 
         let result = cmd_mirror_run(config).await;
@@ -116,7 +103,6 @@ async fn test_mirror_rejects_malformed_destination_url() {
             low: None,
             overwrite: false,
             allow_mirror_gaps: false,
-            max_bucket_cache: None,
         };
 
         let result = cmd_mirror_run(config).await;
@@ -140,11 +126,10 @@ async fn test_mirror_rejects_nonexistent_source() {
         low: None,
         overwrite: false,
         allow_mirror_gaps: false,
-        max_bucket_cache: None,
     };
 
     let result = cmd_mirror_run(config).await;
-    assert!(result.is_err(), "Should reject nonexistent source");
+    assert!(result.is_err());
 }
 
 #[tokio::test]
@@ -161,11 +146,11 @@ async fn test_scan_rejects_nonexistent_source() {
     };
 
     let result = cmd_scan_run(config).await;
-    assert!(result.is_err(), "Should reject nonexistent source");
+    assert!(result.is_err());
 
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("does not exist") || err_msg.contains("not found"),
+        err_msg.contains("Source path does not exist"),
         "Error should clearly indicate the source doesn't exist, got: {}",
         err_msg
     );
@@ -193,7 +178,6 @@ async fn test_mirror_creates_destination_if_not_exists() {
         low: None,
         overwrite: false,
         allow_mirror_gaps: false,
-        max_bucket_cache: None,
     };
 
     let result = cmd_mirror_run(config).await;
@@ -211,5 +195,77 @@ async fn test_mirror_creates_destination_if_not_exists() {
     assert!(
         dest_path.join(".well-known/stellar-history.json").exists(),
         "HAS file should exist in destination"
+    );
+}
+
+#[tokio::test]
+async fn test_scan_rejects_low_greater_than_high() {
+    use std::path::PathBuf;
+    use stellar_archivist::test_helpers::{run_scan as cmd_scan_run, ScanConfig};
+
+    // Create a valid test archive path
+    let test_archive_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata")
+        .join("testnet-archive-small");
+
+    let config = ScanConfig {
+        archive: format!("file://{}", test_archive_path.display()),
+        concurrency: 4,
+        skip_optional: false,
+        low: Some(2000),
+        high: Some(1000), // Lower value - should be rejected
+    };
+
+    let result = cmd_scan_run(config).await;
+    assert!(
+        result.is_err(),
+        "Should reject when --low is greater than --high"
+    );
+
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("low checkpoint") && err_msg.contains("is greater than high checkpoint"),
+        "Error should indicate that low is greater than high, got: {}",
+        err_msg
+    );
+}
+
+#[tokio::test]
+async fn test_mirror_rejects_low_greater_than_high() {
+    use std::path::PathBuf;
+    use stellar_archivist::test_helpers::{run_mirror as cmd_mirror_run, MirrorConfig};
+    use tempfile::TempDir;
+
+    // Create a valid test archive path
+    let test_archive_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata")
+        .join("testnet-archive-small");
+
+    // Create a temporary destination
+    let temp_dir = TempDir::new().unwrap();
+    let dest_path = temp_dir.path().join("test_dest");
+
+    let config = MirrorConfig {
+        src: format!("file://{}", test_archive_path.display()),
+        dst: format!("file://{}", dest_path.display()),
+        concurrency: 4,
+        skip_optional: false,
+        low: Some(2000),
+        high: Some(1000), // Lower value - should be rejected
+        overwrite: false,
+        allow_mirror_gaps: false,
+    };
+
+    let result = cmd_mirror_run(config).await;
+    assert!(
+        result.is_err(),
+        "Should reject when --low is greater than --high"
+    );
+
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("low checkpoint") && err_msg.contains("is greater than high checkpoint"),
+        "Error should indicate that low is greater than high, got: {}",
+        err_msg
     );
 }

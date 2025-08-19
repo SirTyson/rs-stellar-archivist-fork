@@ -1,62 +1,21 @@
-//! Stellar History Archive State (HAS) file format handling.
+//! Stellar history file format handling.
 //!
-//! This module provides types and functions for working with Stellar's
-//! History Archive State files.
+//! This module provides types and functions for working with Stellar
+//! Archive history files.
 
 use serde::{Deserialize, Serialize};
 
-// Stellar bucketlist has exactly 11 levels
+// Both Bucket List types have exactly 11 levels
 const NUM_BUCKETLIST_LEVELS: usize = 11;
 // Checkpoints occur every 64 ledgers
 pub const CHECKPOINT_FREQUENCY: u32 = 64;
+// The first checkpoint ledger
+pub const GENESIS_CHECKPOINT_LEDGER: u32 = CHECKPOINT_FREQUENCY - 1;
 
-// Archive file categories
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileCategory {
-    History,
-    Ledger,
-    Transactions,
-    Results,
-    Scp,
-    Bucket,
-}
+// Standard location for .well-known file in archives
+pub const ROOT_WELL_KNOWN_PATH: &str = ".well-known/stellar-history.json";
 
-impl FileCategory {
-    pub fn as_str(&self) -> &str {
-        match self {
-            FileCategory::History => "history",
-            FileCategory::Ledger => "ledger",
-            FileCategory::Transactions => "transactions",
-            FileCategory::Results => "results",
-            FileCategory::Scp => "scp",
-            FileCategory::Bucket => "bucket",
-        }
-    }
-
-    pub fn extension(&self) -> &str {
-        match self {
-            FileCategory::History => "json",
-            _ => "xdr.gz",
-        }
-    }
-
-    pub fn is_optional(&self) -> bool {
-        matches!(self, FileCategory::Scp)
-    }
-
-    pub fn required_categories() -> &'static [FileCategory] {
-        &[
-            FileCategory::History,
-            FileCategory::Ledger,
-            FileCategory::Transactions,
-            FileCategory::Results,
-        ]
-    }
-}
-// Standard location for HAS file in archives
-pub const ROOT_HAS_PATH: &str = ".well-known/stellar-history.json";
-
-// Root HAS structure describing archive state at a checkpoint
+// Root .well-known structure describing archive state at a checkpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryFileState {
     pub version: i32,
@@ -192,7 +151,7 @@ impl HistoryFileState {
         Ok(())
     }
 
-    // Validate HAS format for basic structural/string correctness
+    // Validate .well-known format for basic structural/string correctness
     pub fn validate(&self) -> Result<(), String> {
         if self.version != 1 && self.version != 2 {
             return Err(format!(
@@ -203,10 +162,10 @@ impl HistoryFileState {
 
         // Version 2 must have hotArchiveBuckets, version 1 must not
         if self.version == 2 && self.hot_archive_buckets.is_none() {
-            return Err("Version 2 HAS must have hotArchiveBuckets field".to_string());
+            return Err("Version 2 .well-known must have hotArchiveBuckets field".to_string());
         }
         if self.version == 1 && self.hot_archive_buckets.is_some() {
-            return Err("Version 1 HAS must not have hotArchiveBuckets field".to_string());
+            return Err("Version 1 .well-known must not have hotArchiveBuckets field".to_string());
         }
 
         if self.current_ledger == 0 {
@@ -287,7 +246,7 @@ impl HistoryFileState {
         }
 
         let mut checkpoints = Vec::with_capacity(num_checkpoints);
-        let mut checkpoint = CHECKPOINT_FREQUENCY - 1; // Start at first checkpoint (63)
+        let mut checkpoint = GENESIS_CHECKPOINT_LEDGER; // Start at first checkpoint (63)
 
         while checkpoint <= self.current_ledger {
             checkpoints.push(checkpoint);
@@ -316,12 +275,55 @@ pub fn is_zero_hash(hash: &str) -> bool {
     hash == "0000000000000000000000000000000000000000000000000000000000000000"
 }
 
-// Round down to nearest checkpoint
-pub fn checkpoint_number(ledger: u32) -> u32 {
-    if ledger < CHECKPOINT_FREQUENCY - 1 {
+/// Helper function to round to checkpoint boundary
+/// If round_up is true, rounds up; otherwise rounds down
+/// If the ledger is already a checkpoint, returns it unchanged
+/// The minimum returned value is GENESIS_CHECKPOINT_LEDGER (63)
+fn round_to_checkpoint(ledger: u32, round_up: bool) -> u32 {
+    if ledger < GENESIS_CHECKPOINT_LEDGER {
+        GENESIS_CHECKPOINT_LEDGER
+    } else if (ledger + 1) % CHECKPOINT_FREQUENCY == 0 {
+        // Already a checkpoint
+        ledger
+    } else {
+        // Calculate the checkpoint number (0-based from genesis)
+        let checkpoint_num = (ledger + 1) / CHECKPOINT_FREQUENCY;
+        // Round up or down as requested
+        let final_num = if round_up {
+            checkpoint_num + 1
+        } else {
+            checkpoint_num
+        };
+        final_num * CHECKPOINT_FREQUENCY - 1
+    }
+}
+
+pub fn round_to_lower_checkpoint(ledger: u32) -> u32 {
+    round_to_checkpoint(ledger, false)
+}
+
+pub fn round_to_upper_checkpoint(ledger: u32) -> u32 {
+    round_to_checkpoint(ledger, true)
+}
+
+/// Count the number of checkpoints in the inclusive range [low_checkpoint, high_checkpoint]
+/// Both parameters should already be valid checkpoint values
+pub fn count_checkpoints_in_range(low_checkpoint: u32, high_checkpoint: u32) -> usize {
+    debug_assert!(
+        is_checkpoint(low_checkpoint),
+        "low_checkpoint {} is not a valid checkpoint",
+        low_checkpoint
+    );
+    debug_assert!(
+        is_checkpoint(high_checkpoint),
+        "high_checkpoint {} is not a valid checkpoint",
+        high_checkpoint
+    );
+
+    if high_checkpoint < low_checkpoint {
         0
     } else {
-        (ledger + 1) / CHECKPOINT_FREQUENCY * CHECKPOINT_FREQUENCY - 1
+        ((high_checkpoint - low_checkpoint) / CHECKPOINT_FREQUENCY + 1) as usize
     }
 }
 
@@ -388,97 +390,4 @@ pub fn checkpoint_path(category: &str, checkpoint: u32) -> String {
         "{}/{}/{}-{:08x}.{}",
         category, prefix, category, checkpoint, ext
     )
-}
-
-// Generate archive path for checkpoint file using FileCategory enum
-pub fn checkpoint_path_typed(category: FileCategory, checkpoint: u32) -> String {
-    let prefix = checkpoint_prefix(checkpoint);
-    format!(
-        "{}/{}/{}-{:08x}.{}",
-        category.as_str(),
-        prefix,
-        category.as_str(),
-        checkpoint,
-        category.extension()
-    )
-}
-
-// List all required archive files (excluding optional scp)
-pub fn enumerate_all_files(has: &HistoryFileState) -> Vec<String> {
-    let mut files = Vec::new();
-
-    // Add root HAS
-    files.push(ROOT_HAS_PATH.to_string());
-
-    // Add all buckets
-    for bucket_hash in has.buckets() {
-        if let Ok(path) = bucket_path(&bucket_hash) {
-            files.push(path);
-        }
-    }
-
-    // Add all checkpoint files
-    let checkpoints = has.get_checkpoint_range();
-    for checkpoint in checkpoints {
-        for category in &["history", "ledger", "transactions", "results"] {
-            files.push(checkpoint_path(category, checkpoint));
-        }
-    }
-
-    files.sort();
-    files
-}
-
-// List all archive files including optional scp
-pub fn enumerate_all_files_with_optional(has: &HistoryFileState) -> Vec<String> {
-    let mut files = enumerate_all_files(has);
-
-    let checkpoints = has.get_checkpoint_range();
-    for checkpoint in checkpoints {
-        files.push(checkpoint_path("scp", checkpoint));
-    }
-
-    files.sort();
-    files
-}
-
-// List all checkpoint files for the given HAS (without buckets or root HAS)
-pub fn enumerate_checkpoint_files(has: &HistoryFileState, include_optional: bool) -> Vec<String> {
-    let mut files = Vec::new();
-    let checkpoints = has.get_checkpoint_range();
-
-    for checkpoint in checkpoints {
-        // Add all required categories
-        for category in FileCategory::required_categories() {
-            files.push(checkpoint_path_typed(*category, checkpoint));
-        }
-
-        // Add optional SCP if requested
-        if include_optional {
-            files.push(checkpoint_path_typed(FileCategory::Scp, checkpoint));
-        }
-    }
-
-    files
-}
-
-/// Generate list of files for a specific checkpoint
-pub fn enumerate_checkpoint_files_for(
-    _has: &HistoryFileState,
-    checkpoint: u32,
-    include_optional: bool,
-) -> Vec<String> {
-    let mut files = Vec::new();
-
-    // Add all required categories
-    for category in FileCategory::required_categories() {
-        files.push(checkpoint_path_typed(*category, checkpoint));
-    }
-
-    // Add optional SCP if requested
-    if include_optional {
-        files.push(checkpoint_path_typed(FileCategory::Scp, checkpoint));
-    }
-
-    files
 }

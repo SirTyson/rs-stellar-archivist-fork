@@ -1,17 +1,13 @@
-//! Utilities for Stellar History Archives including stats tracking and fetching
-
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::history_file::HistoryFileState;
-
-/// Storage reference - unified through Storage trait (no double indirection)
-pub type StorageRef = Arc<dyn crate::storage::Storage + Send + Sync>;
+use crate::storage::StorageRef;
 
 /// Shared statistics tracking for archive operations
-/// Provides consistent reporting across scan and mirror operations
+/// for consistent reporting across scan and mirror operations
 pub struct ArchiveStats {
     // Successfully processed files
     pub successful_files: AtomicU64,
@@ -22,16 +18,13 @@ pub struct ArchiveStats {
     // Skipped files (already exist in mirror mode)
     pub skipped_files: AtomicU64,
 
-    // Missing required files (scan mode)
     pub missing_required: AtomicU64,
-
-    // Missing files by category
     pub missing_history: AtomicU64,
     pub missing_ledger: AtomicU64,
     pub missing_transactions: AtomicU64,
     pub missing_results: AtomicU64,
     pub missing_buckets: AtomicU64,
-    pub missing_scp: AtomicU64, // Optional files
+    pub missing_scp: AtomicU64,
 
     // List of all failed/missing files for detailed reporting
     pub failed_list: Arc<tokio::sync::Mutex<Vec<String>>>,
@@ -54,21 +47,18 @@ impl ArchiveStats {
         }
     }
 
-    /// Record a successful file processing
     pub fn record_success(&self, _path: &str) {
         self.successful_files.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a skipped file (already exists)
+    /// Record a skipped file (already exists in mirror mode)
     pub fn record_skipped(&self, _path: &str) {
         self.skipped_files.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a failed/missing file and categorize it
-    pub async fn record_failure(&self, path: &str, _reason: &str) {
+    pub async fn record_failure(&self, path: &str) {
         self.failed_files.fetch_add(1, Ordering::Relaxed);
 
-        // Categorize the failure by file type
         if path.contains("history") {
             self.missing_history.fetch_add(1, Ordering::Relaxed);
         } else if path.contains("ledger") {
@@ -83,12 +73,10 @@ impl ArchiveStats {
             self.missing_scp.fetch_add(1, Ordering::Relaxed);
         }
 
-        // Track if it's a required file (not optional SCP)
         if !path.contains("scp") {
             self.missing_required.fetch_add(1, Ordering::Relaxed);
         }
 
-        // Add to failed list for detailed reporting
         let mut failed_list = self.failed_list.lock().await;
         failed_list.push(path.to_string());
     }
@@ -99,7 +87,6 @@ impl ArchiveStats {
         let failed = self.failed_files.load(Ordering::Relaxed);
         let skipped = self.skipped_files.load(Ordering::Relaxed);
 
-        // Log the summary
         if operation == "mirror" {
             info!(
                 "Mirror completed: {} files copied, {} failed, {} skipped",
@@ -113,7 +100,6 @@ impl ArchiveStats {
             );
         }
 
-        // Log detailed breakdown if there were failures
         if failed == 0 {
             return;
         }
@@ -125,7 +111,6 @@ impl ArchiveStats {
         let missing_buckets = self.missing_buckets.load(Ordering::Relaxed);
         let missing_scp = self.missing_scp.load(Ordering::Relaxed);
 
-        // Log breakdown by category
         if missing_history > 0 {
             error!("Missing {} history files", missing_history);
         }
@@ -146,88 +131,120 @@ impl ArchiveStats {
         }
     }
 
-    /// Check if there were any failures that should fail the operation
     pub fn has_failures(&self) -> bool {
         self.failed_files.load(Ordering::Relaxed) > 0
     }
 }
 
-/// Validate that a source archive exists and is accessible
-/// Returns the HAS file if found, to avoid re-reading it
-/// Only validates filesystem paths to avoid triggering network requests
-pub async fn validate_source_and_get_has(
-    store: &StorageRef,
-    url: &str,
-) -> Result<Option<HistoryFileState>> {
-    use crate::history_file::ROOT_HAS_PATH;
-
-    // Only validate file:// URLs to avoid triggering network requests
-    // HTTP/HTTPS errors will be caught naturally when we try to fetch
-    if url.starts_with("file://") {
-        let path = url.trim_start_matches("file://");
-        if !std::path::Path::new(path).exists() {
-            anyhow::bail!(
-                "Source path does not exist: {}\nPlease check the path and try again.",
-                path
-            );
-        }
-
-        // Try to read the HAS file for filesystem paths
-        match fetch_history_archive_state(store).await {
-            Ok(has) => Ok(Some(has)),
-            Err(e) => {
-                // Check if it's because the file doesn't exist
-                if store.exists(ROOT_HAS_PATH).await? == false {
-                    anyhow::bail!(
-                        "Source path exists but is not a valid Stellar History Archive: {}\nNo {} file found.",
-                        path, ROOT_HAS_PATH
-                    );
-                }
-                // Other error accessing the HAS
-                Err(e)
-                    .with_context(|| format!("Failed to read History Archive State from: {}", url))
-            }
-        }
-    } else {
-        // For HTTP/HTTPS, we'll fetch the HAS during normal operation
-        Ok(None)
-    }
-}
-
-/// Fetch the root History Archive State
-pub async fn fetch_history_archive_state(store: &StorageRef) -> Result<HistoryFileState> {
-    use crate::history_file::ROOT_HAS_PATH;
-    fetch_history_archive_state_path(store, ROOT_HAS_PATH).await
-}
-
-/// Fetch a History Archive State from a specific path
-pub async fn fetch_history_archive_state_path(
-    store: &StorageRef,
-    path: &str,
-) -> Result<HistoryFileState> {
+/// Fetch and validate .well-known/stellar-history.json from store
+pub async fn fetch_well_known_history_file(store: &StorageRef) -> Result<HistoryFileState> {
+    use crate::history_file::ROOT_WELL_KNOWN_PATH;
     use tokio::io::AsyncReadExt;
     use tracing::debug;
 
-    debug!("Fetching HAS from path: {}", path);
+    debug!("Fetching .well-known from path: {}", ROOT_WELL_KNOWN_PATH);
 
     // Read the file content
     let mut reader = store
-        .open_reader(path)
+        .open_reader(ROOT_WELL_KNOWN_PATH)
         .await
-        .with_context(|| format!("Failed to open reader for: {}", path))?;
+        .with_context(|| format!("Failed to open reader for: {}", ROOT_WELL_KNOWN_PATH))?;
     let mut buffer = Vec::new();
     reader
         .read_to_end(&mut buffer)
         .await
-        .with_context(|| format!("Failed to read file: {}", path))?;
+        .with_context(|| format!("Failed to read file: {}", ROOT_WELL_KNOWN_PATH))?;
 
     // Parse the JSON
-    let has: HistoryFileState = serde_json::from_slice(&buffer)
-        .with_context(|| format!("Failed to parse History Archive State from: {}", path))?;
+    let state: HistoryFileState = serde_json::from_slice(&buffer).with_context(|| {
+        format!(
+            "Failed to parse History Archive State from: {}",
+            ROOT_WELL_KNOWN_PATH
+        )
+    })?;
 
-    // Validate the HAS format
-    has.validate()
-        .map_err(|e| anyhow::anyhow!("Invalid HAS format in {}: {}", path, e))?;
+    // Validate the .well-known format
+    state.validate().map_err(|e| {
+        anyhow::anyhow!(
+            "Invalid .well-known format in {}: {}",
+            ROOT_WELL_KNOWN_PATH,
+            e
+        )
+    })?;
 
-    Ok(has)
+    Ok(state)
+}
+
+/// Compute checkpoint bounds from source archive and user-specified low/high values
+/// Returns (first_checkpoint, final_checkpoint)
+pub async fn compute_checkpoint_bounds(
+    source: &StorageRef,
+    low: Option<u32>,
+    high: Option<u32>,
+) -> Result<(u32, u32)> {
+    use crate::history_file;
+    use tracing::{info, warn};
+
+    // Fetch the .well-known file from source
+    let state = fetch_well_known_history_file(source).await?;
+    let current_ledger = state.current_ledger;
+    let highest_source_checkpoint = history_file::round_to_lower_checkpoint(current_ledger);
+
+    info!(
+        "Source archive reports current ledger: {} (checkpoint: 0x{:08x})",
+        current_ledger, highest_source_checkpoint
+    );
+
+    // Check that the user-specified low is not below the source's current checkpoint
+    // If low is not provided, default to genesis checkpoint
+    let low_checkpoint = if let Some(low) = low {
+        let low_checkpoint = history_file::round_to_lower_checkpoint(low);
+
+        // Check if the source's current checkpoint is below requested low
+        if highest_source_checkpoint < low_checkpoint {
+            anyhow::bail!(
+                "No checkpoints above the lower bound: archive's latest checkpoint 0x{:08x} (ledger {}) is below requested low 0x{:08x} (ledger {})",
+                highest_source_checkpoint, current_ledger, low_checkpoint, low
+            );
+        }
+
+        low_checkpoint
+    } else {
+        history_file::GENESIS_CHECKPOINT_LEDGER
+    };
+
+    let high_checkpoint = if let Some(high) = high {
+        let high_checkpoint = history_file::round_to_upper_checkpoint(high);
+
+        // Warn if the user passed a high ledger that is above what we see in source
+        // We don't fail, but use the source's current checkpoint as the high bound
+        if highest_source_checkpoint < high_checkpoint {
+            warn!(
+                "Archive's latest checkpoint 0x{:08x} (ledger {}) is below requested high 0x{:08x} (ledger {}), will process up to latest available",
+                highest_source_checkpoint, current_ledger, high_checkpoint, high
+            );
+            highest_source_checkpoint
+        } else {
+            high_checkpoint
+        }
+    } else {
+        highest_source_checkpoint
+    };
+
+    // Make sure we have at least one checkpoint in range
+    if low_checkpoint > high_checkpoint {
+        anyhow::bail!(
+            "No checkpoints found in range: low checkpoint 0x{:08x} is greater than high checkpoint 0x{:08x}",
+            low_checkpoint,
+            high_checkpoint
+        );
+    }
+
+    let total_count = history_file::count_checkpoints_in_range(low_checkpoint, high_checkpoint);
+    info!(
+        "Processing {} checkpoints from 0x{:08x} to 0x{:08x}",
+        total_count, low_checkpoint, high_checkpoint
+    );
+
+    Ok((low_checkpoint, high_checkpoint))
 }

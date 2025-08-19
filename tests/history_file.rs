@@ -2,7 +2,9 @@ use rstest::*;
 use std::fs;
 use std::io::Write;
 use stellar_archivist::history_file::{
-    checkpoint_number, checkpoint_prefix, is_checkpoint, is_valid_bucket_hash, HistoryFileState,
+    checkpoint_prefix, count_checkpoints_in_range, is_checkpoint, is_valid_bucket_hash,
+    round_to_lower_checkpoint, round_to_upper_checkpoint, HistoryFileState,
+    GENESIS_CHECKPOINT_LEDGER,
 };
 use tempfile::NamedTempFile;
 
@@ -626,15 +628,64 @@ fn test_get_checkpoint_range(mut canonical_v1_json: serde_json::Value) {
 }
 
 #[test]
-fn test_checkpoint_number_calculation() {
-    assert_eq!(checkpoint_number(0), 0);
-    assert_eq!(checkpoint_number(1), 0);
-    assert_eq!(checkpoint_number(63), 63);
-    assert_eq!(checkpoint_number(64), 63);
-    assert_eq!(checkpoint_number(127), 127);
-    assert_eq!(checkpoint_number(128), 127);
-    assert_eq!(checkpoint_number(191), 191);
-    assert_eq!(checkpoint_number(192), 191);
+fn test_round_to_lower_checkpoint() {
+    // Below genesis should return genesis
+    assert_eq!(round_to_lower_checkpoint(0), GENESIS_CHECKPOINT_LEDGER);
+    assert_eq!(round_to_lower_checkpoint(1), GENESIS_CHECKPOINT_LEDGER);
+    assert_eq!(round_to_lower_checkpoint(62), GENESIS_CHECKPOINT_LEDGER);
+
+    // Checkpoints should return unchanged
+    assert_eq!(round_to_lower_checkpoint(63), 63);
+    assert_eq!(round_to_lower_checkpoint(127), 127);
+    assert_eq!(round_to_lower_checkpoint(191), 191);
+
+    // Non-checkpoints should round down
+    assert_eq!(round_to_lower_checkpoint(64), 63);
+    assert_eq!(round_to_lower_checkpoint(100), 63);
+    assert_eq!(round_to_lower_checkpoint(126), 63);
+    assert_eq!(round_to_lower_checkpoint(128), 127);
+    assert_eq!(round_to_lower_checkpoint(190), 127);
+    assert_eq!(round_to_lower_checkpoint(192), 191);
+}
+
+#[test]
+fn test_round_to_upper_checkpoint() {
+    // Below genesis should return genesis
+    assert_eq!(round_to_upper_checkpoint(0), GENESIS_CHECKPOINT_LEDGER);
+    assert_eq!(round_to_upper_checkpoint(1), GENESIS_CHECKPOINT_LEDGER);
+    assert_eq!(round_to_upper_checkpoint(62), GENESIS_CHECKPOINT_LEDGER);
+
+    // Checkpoints should return unchanged
+    assert_eq!(round_to_upper_checkpoint(63), 63);
+    assert_eq!(round_to_upper_checkpoint(127), 127);
+    assert_eq!(round_to_upper_checkpoint(191), 191);
+
+    // Non-checkpoints should round up
+    assert_eq!(round_to_upper_checkpoint(64), 127);
+    assert_eq!(round_to_upper_checkpoint(100), 127);
+    assert_eq!(round_to_upper_checkpoint(126), 127);
+    assert_eq!(round_to_upper_checkpoint(128), 191);
+    assert_eq!(round_to_upper_checkpoint(190), 191);
+    assert_eq!(round_to_upper_checkpoint(192), 255);
+}
+
+#[test]
+fn test_count_checkpoints_in_range() {
+    // Single checkpoint
+    assert_eq!(count_checkpoints_in_range(63, 63), 1);
+    assert_eq!(count_checkpoints_in_range(127, 127), 1);
+
+    // Multiple checkpoints
+    assert_eq!(count_checkpoints_in_range(63, 127), 2);
+    assert_eq!(count_checkpoints_in_range(63, 191), 3);
+    assert_eq!(count_checkpoints_in_range(127, 255), 3);
+    assert_eq!(count_checkpoints_in_range(63, 255), 4);
+
+    // Invalid range (high < low)
+    assert_eq!(count_checkpoints_in_range(127, 63), 0);
+
+    // Large range
+    assert_eq!(count_checkpoints_in_range(63, 639), 10);
 }
 
 #[test]
@@ -738,7 +789,7 @@ fn test_version_2_missing_hot_archive_buckets(mut canonical_v2_json: serde_json:
 
     let has: HistoryFileState = serde_json::from_value(canonical_v2_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("Version 2 HAS must have hotArchiveBuckets field"));
+    assert!(error.contains("Version 2 .well-known must have hotArchiveBuckets field"));
 }
 
 #[rstest]
@@ -751,7 +802,7 @@ fn test_version_1_with_hot_archive_buckets(
 
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("Version 1 HAS must not have hotArchiveBuckets field"));
+    assert!(error.contains("Version 1 .well-known must not have hotArchiveBuckets field"));
 }
 
 #[rstest]

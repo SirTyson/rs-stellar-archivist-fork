@@ -147,8 +147,6 @@ async fn test_max_retries_exceeded() {
     assert!(error_msg.contains("HTTP 500") || error_msg.contains("after 3 retries"));
 }
 
-// Removed HEAD fallback tests since modern HTTP servers should support HEAD
-
 /// Test exists() with successful HEAD request
 #[tokio::test]
 async fn test_exists_with_head_success() {
@@ -207,25 +205,25 @@ async fn test_exists_retries_on_server_error() {
     assert!(exists);
 }
 
-/// Test exists() retries and eventually errors for unexpected status codes
+/// Test exists() retries and eventually errors
 #[tokio::test]
 async fn test_exists_error_on_unexpected_status() {
     let mock_server = MockServer::start().await;
 
-    // Return 403 Forbidden - this should retry then error after max retries
+    // Return 401 Unauthorized - this should retry then error after max retries
     Mock::given(method("HEAD"))
-        .and(path("/forbidden"))
-        .respond_with(ResponseTemplate::new(403))
+        .and(path("/unauthorized"))
+        .respond_with(ResponseTemplate::new(401))
         .mount(&mock_server)
         .await;
 
     let store = HttpStore::new(mock_server.uri().parse().unwrap(), test_retry_config());
 
-    let result = store.exists("forbidden").await;
+    let result = store.exists("unauthorized").await;
     assert!(result.is_err());
     let error_msg = result.err().unwrap().to_string();
     assert!(error_msg.contains("Failed to check existence"));
-    assert!(error_msg.contains("403"));
+    assert!(error_msg.contains("401"));
 }
 
 /// Test network/connection errors trigger retry

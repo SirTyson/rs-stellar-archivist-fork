@@ -2,42 +2,50 @@
 //!
 //! The pipeline coordinates parallel processing of archive checkpoints and their files.
 //! It discovers checkpoints to process, distributes work to concurrent workers, and
-//! delegates file processing to the provided Operation implementation.
+//! delegates file processing to the provided Operation implementation. The pipeline
+//! is responsible for tasks common to all operations. This includes handling worker concurrency,
+//! fetching history files, deduping bucket files, and spawning work for each file.
+//! Each operation defines business logic for actually processing the files.
 //!
-//! ## Architecture
+//! Step 1: Get checkpoint bounds from the operation - Bounds vary based on operation
+//!         and user parameters.
 //!
-//! 1. **Checkpoint Discovery**: Reads the archive's HAS file to determine checkpoint range
-//! 2. **Work Distribution**: Spawns workers that process checkpoints concurrently  
-//! 3. **File Processing**: Each checkpoint's files (ledger, transactions, results, buckets)
-//!    are processed in parallel with concurrency controlled by a semaphore
-//! 4. **Operation Delegation**: The actual work (scan/mirror) is performed by the Operation trait
+//! Step 2: Process history checkpoint files to generate file fetching work - For each checkpoint,
+//!         download and parse the history JSON file to identify all files that need processing.
 //!
-//! The pipeline handles checkpoint enumeration, file discovery, bucket deduplication,
-//! and concurrency management. Operations define what to do with each file.
+//! Step 3: Dedup bucket files and dispatch work to the operation - For each deduped file,
+//!         spawn a file processing task. The task will open a reader and hand it off to the
+//!         operation's process_object method.
+//!
 use anyhow::Result;
 use lru::LruCache;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::Mutex;
-use tokio::sync::OnceCell;
 
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::history_file;
-use crate::utils::fetch_history_archive_state;
+use crate::storage::ReaderResult;
 
-/// Result from attempting to get a reader for an object
-pub enum ReaderResult {
-    /// Successfully obtained a reader
-    Ok(crate::storage::BoxedAsyncRead),
-    /// Failed to get reader (file missing or inaccessible)
-    Err(anyhow::Error),
-}
+/// Maximum number of bucket entries to cache in the LRU for deduplication
+/// 1 million entries * ~64 bytes per hash = ~64MB memory max
+const BUCKET_LRU_CACHE_SIZE: usize = 1_000_000;
 
-/// Simplified operation trait - operations only define how to process objects
+/// How often to report progress (every N checkpoints)
+const PROGRESS_REPORTING_FREQUENCY: usize = 100;
+
+/// Unified operation trait for scan and mirror
 #[async_trait::async_trait]
 pub trait Operation: Send + Sync + 'static {
+    /// Get the checkpoint bounds for this operation
+    /// Returns (lower_bound, upper_bound) checkpoints to process
+    async fn get_checkpoint_bounds(
+        &self,
+        source: &crate::storage::StorageRef,
+    ) -> Result<(u32, u32)>;
+
     /// Process an object
     /// The Pipeline provides either a reader that streams the object content,
     /// or an error if the reader couldn't be obtained (e.g., file not found)
@@ -45,23 +53,19 @@ pub trait Operation: Send + Sync + 'static {
     async fn process_object(&self, object: &str, reader_result: ReaderResult);
 
     /// Called when all work is complete
-    /// The pipeline passes the highest checkpoint that was processed (if any)
+    /// The pipeline passes the highest checkpoint that was processed
     /// This is where operations should check their internal failure counts and return an error if needed
-    async fn finalize(&self, highest_checkpoint: Option<u32>) -> Result<()>;
+    async fn finalize(&self, highest_checkpoint: u32) -> Result<()>;
 }
 
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
-    /// Source archive URL
+    /// Source archive URL, as provided by the user
     pub source: String,
     /// Number of concurrent workers for processing
     pub concurrency: usize,
-    /// Whether to skip optional files
+    /// Whether to skip optional SCP files
     pub skip_optional: bool,
-    /// Optional low ledger limit (start from this ledger)
-    pub low: Option<u32>,
-    /// Optional high ledger limit (stop at this ledger)
-    pub high: Option<u32>,
     /// Maximum number of HTTP retry attempts
     pub max_retries: u32,
     /// Initial backoff in milliseconds for HTTP retries
@@ -74,42 +78,17 @@ impl Default for PipelineConfig {
             source: String::new(),
             concurrency: 64,
             skip_optional: false,
-            low: None,
-            high: None,
             max_retries: 3,
             initial_backoff_ms: 100,
         }
     }
 }
 
-/// Checkpoint range for processing
-#[derive(Debug, Clone)]
-struct CheckpointRange {
-    /// Next checkpoint to process (mutex-guarded)
-    next: Arc<Mutex<u32>>,
-    /// Upper bound (inclusive)
-    upper_bound: u32,
-    /// Total number of checkpoints for progress tracking
-    total_count: usize,
-}
-
-impl CheckpointRange {
-    fn new(low: u32, high: u32) -> Self {
-        // Calculate total count for progress tracking
-        let total_count = ((high - low) / history_file::CHECKPOINT_FREQUENCY + 1) as usize;
-        Self {
-            next: Arc::new(Mutex::new(low)),
-            upper_bound: high,
-            total_count,
-        }
-    }
-}
-
 /// Represents the source of data for a file fetching task.
 enum FileTaskSource {
-    /// Fetch from storage backend. This is used for all non-history files.
+    /// Fetch from storage backend.
     Storage { is_optional: bool },
-    /// Use already-buffered content. We use this for history files, since both
+    /// Fetch from already-buffered content. We use this for history files, since both
     /// the pipeline and the archival op need to read the file.
     Buffered(Vec<u8>),
     /// Report an error. This is only used for history files, where the previous
@@ -118,18 +97,15 @@ enum FileTaskSource {
 }
 
 pub struct Pipeline<Op: Operation> {
-    /// The operation to execute on archive files
-    pub operation: Arc<Op>,
+    operation: Arc<Op>,
     config: PipelineConfig,
-    source_op: crate::utils::StorageRef,
+    source_op: crate::storage::StorageRef,
     bucket_lru: Arc<Mutex<LruCache<String, ()>>>,
-    highest_checkpoint: Arc<OnceCell<u32>>,
+
     /// Semaphore to limit total concurrent I/O operations
     io_permits: Arc<tokio::sync::Semaphore>,
     /// Counter for outstanding (spawned but not completed) download tasks
     inflight_files: Arc<std::sync::atomic::AtomicUsize>,
-    /// Cached HAS from validation to avoid re-reading
-    cached_has: Arc<OnceCell<crate::history_file::HistoryFileState>>,
 }
 
 impl<Op: Operation> Pipeline<Op> {
@@ -142,10 +118,9 @@ impl<Op: Operation> Pipeline<Op> {
         };
         let source_op =
             crate::storage::StorageBackend::from_url(&config.source, Some(retry_config)).await?;
-        // Create LRU cache for bucket deduplication (bounded to 1 million entries)
-        // 1 million entries * ~64 bytes per hash = ~64MB memory max
+        // Create LRU cache for bucket deduplication
         let bucket_lru = Arc::new(Mutex::new(LruCache::new(
-            std::num::NonZeroUsize::new(1_000_000).unwrap(),
+            std::num::NonZeroUsize::new(BUCKET_LRU_CACHE_SIZE).unwrap(),
         )));
 
         // Create semaphore to limit total concurrent I/O operations
@@ -157,34 +132,27 @@ impl<Op: Operation> Pipeline<Op> {
             source_op,
             config,
             bucket_lru,
-            highest_checkpoint: Arc::new(OnceCell::new()),
             io_permits,
             inflight_files: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            cached_has: Arc::new(OnceCell::new()), // Will be populated during run() if validation passes
         })
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        // Validate source and get HAS if available
-        let cached_has =
-            crate::utils::validate_source_and_get_has(&self.source_op, &self.config.source).await?;
+        // Get checkpoint bounds from the operation
+        let (lower_bound, upper_bound) = self
+            .operation
+            .get_checkpoint_bounds(&self.source_op)
+            .await?;
 
-        // Store the cached HAS if we got one from validation
-        if let Some(has) = cached_has {
-            self.cached_has.set(has).ok(); // Ignore error if already set
-        }
-
-        // Get checkpoint upper bound from source .well-known/stellar-history.json
-        let (checkpoint_range, _archive_current) = self.compute_checkpoint_bounds().await?;
-        if checkpoint_range.total_count == 0 {
+        // Calculate total count for progress tracking
+        let total_count = history_file::count_checkpoints_in_range(lower_bound, upper_bound);
+        if total_count == 0 {
             info!("No checkpoints to process");
             return Ok(());
         }
 
-        // Store the highest checkpoint we'll be processing
-        self.highest_checkpoint
-            .set(checkpoint_range.upper_bound)
-            .expect("highest_checkpoint should only be set once");
+        // Store the highest checkpoint for passing to finalize later
+        let highest_checkpoint = upper_bound;
 
         // Create checkpoint channel for distributing work
         let (checkpoint_tx, checkpoint_rx) = mpsc::channel(100);
@@ -201,14 +169,12 @@ impl<Op: Operation> Pipeline<Op> {
         );
 
         // Spawn checkpoint producer
-        let range = checkpoint_range.clone();
+        let producer_lower_bound = lower_bound;
+        let producer_upper_bound = upper_bound;
         let producer = tokio::spawn(async move {
-            // Get the starting checkpoint from the range
-            let start = *range.next.lock().unwrap();
-            let upper = range.upper_bound;
-            let mut checkpoint = start;
+            let mut checkpoint = producer_lower_bound;
 
-            while checkpoint <= upper {
+            while checkpoint <= producer_upper_bound {
                 if checkpoint_tx.send(checkpoint).await.is_err() {
                     // Channel closed, workers have stopped
                     break;
@@ -229,7 +195,7 @@ impl<Op: Operation> Pipeline<Op> {
             let pipeline = self.clone();
             let rx = checkpoint_rx.clone();
             let tracker = progress_tracker.clone();
-            let total_count = checkpoint_range.total_count;
+            let processor_total_count = total_count;
             let sem = self.io_permits.clone();
 
             let processor = tokio::spawn(async move {
@@ -276,8 +242,11 @@ impl<Op: Operation> Pipeline<Op> {
 
                     let total = tracker.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
 
-                    if total % 10 == 0 || total == total_count {
-                        info!("Progress: {}/{} checkpoints processed", total, total_count);
+                    if total % PROGRESS_REPORTING_FREQUENCY == 0 || total == processor_total_count {
+                        info!(
+                            "Progress: {}/{} checkpoints processed",
+                            total, processor_total_count
+                        );
                     }
                 }
                 debug!("Processor {} finished", processor_id);
@@ -316,104 +285,9 @@ impl<Op: Operation> Pipeline<Op> {
         debug!("All file tasks completed");
 
         // Finalize operation with the highest checkpoint we processed
-        let highest_checkpoint = self.highest_checkpoint.get().copied();
         self.operation.finalize(highest_checkpoint).await?;
 
         Ok(())
-    }
-
-    /// Compute checkpoint bounds from HAS (returns range and current ledger)
-    async fn compute_checkpoint_bounds(&self) -> Result<(CheckpointRange, u32)> {
-        // Use cached HAS if available, otherwise fetch it
-        let has = if let Some(cached) = self.cached_has.get() {
-            cached.clone()
-        } else {
-            fetch_history_archive_state(&self.source_op).await?
-        };
-        let current_ledger = has.current_ledger;
-        let current_checkpoint = history_file::checkpoint_number(current_ledger);
-
-        info!(
-            "Archive reports current ledger: {} (checkpoint: 0x{:08x})",
-            current_ledger, current_checkpoint
-        );
-
-        // Determine the low checkpoint (starting point)
-        let low_checkpoint = if let Some(low) = self.config.low {
-            let low_checkpoint = history_file::checkpoint_number(low);
-
-            // Edge case: Check if the .well-known file's current checkpoint is below low
-            if current_checkpoint < low_checkpoint {
-                anyhow::bail!(
-                    "No checkpoints above the lower bound: archive's latest checkpoint 0x{:08x} (ledger {}) is below requested low 0x{:08x} (ledger {})",
-                    current_checkpoint, current_ledger, low_checkpoint, low
-                );
-            }
-
-            low_checkpoint
-        } else {
-            // Default to first checkpoint (63)
-            history_file::CHECKPOINT_FREQUENCY - 1
-        };
-
-        // Determine the high checkpoint (ending point)
-        let high_checkpoint = if let Some(high) = self.config.high {
-            let high_checkpoint = history_file::checkpoint_number(high);
-
-            // Edge case: Warn if the latest checkpoint is below high, but continue
-            if current_checkpoint < high_checkpoint {
-                warn!(
-                    "Archive's latest checkpoint 0x{:08x} (ledger {}) is below requested high 0x{:08x} (ledger {}), will scan up to latest available",
-                    current_checkpoint, current_ledger, high_checkpoint, high
-                );
-                current_checkpoint
-            } else {
-                high_checkpoint
-            }
-        } else {
-            current_checkpoint
-        };
-
-        // Validate that low <= high
-        if low_checkpoint > high_checkpoint {
-            anyhow::bail!(
-                "Low checkpoint 0x{:08x} is greater than high checkpoint 0x{:08x}",
-                low_checkpoint,
-                high_checkpoint
-            );
-        }
-
-        // Validate that checkpoints exist in the range
-        // The actual checkpoints must be aligned to 63, 127, 191, etc.
-        let first_checkpoint = if low_checkpoint < history_file::CHECKPOINT_FREQUENCY - 1 {
-            history_file::CHECKPOINT_FREQUENCY - 1
-        } else {
-            // Round up to next checkpoint boundary if needed
-            let remainder = (low_checkpoint + 1) % history_file::CHECKPOINT_FREQUENCY;
-            if remainder == 0 {
-                low_checkpoint
-            } else {
-                low_checkpoint + (history_file::CHECKPOINT_FREQUENCY - remainder)
-            }
-        };
-
-        // Make sure we have at least one checkpoint in range
-        if first_checkpoint > high_checkpoint {
-            anyhow::bail!(
-                "No checkpoints found in range 0x{:08x} to 0x{:08x}",
-                low_checkpoint,
-                high_checkpoint
-            );
-        }
-
-        let checkpoint_range = CheckpointRange::new(first_checkpoint, high_checkpoint);
-
-        info!(
-            "Processing {} checkpoints from 0x{:08x} to 0x{:08x}",
-            checkpoint_range.total_count, first_checkpoint, high_checkpoint
-        );
-
-        Ok((checkpoint_range, current_ledger))
     }
 
     /// Unified helper to spawn a file processing task with proper concurrency control
@@ -433,20 +307,17 @@ impl<Op: Operation> Pipeline<Op> {
             // Get or create the reader based on the source
             let reader_result = match source {
                 // Open a reader stream for the file from backend storage
-                FileTaskSource::Storage { is_optional } => {
-                    // Fetch from storage
-                    match src.open_reader(&path).await {
-                        Ok(reader) => ReaderResult::Ok(reader),
-                        Err(e) => {
-                            if is_optional {
-                                debug!("Failed to get reader for optional {}: {}", path, e);
-                            } else {
-                                error!("Failed to get reader for {}: {}", path, e);
-                            }
-                            ReaderResult::Err(e.into())
+                FileTaskSource::Storage { is_optional } => match src.open_reader(&path).await {
+                    Ok(reader) => ReaderResult::Ok(reader),
+                    Err(e) => {
+                        if is_optional {
+                            debug!("Failed to get reader for optional {}: {}", path, e);
+                        } else {
+                            error!("Failed to get reader for {}: {}", path, e);
                         }
+                        ReaderResult::Err(e.into())
                     }
-                }
+                },
                 // Use already-buffered content
                 FileTaskSource::Buffered(buffer) => {
                     let reader =
@@ -494,10 +365,11 @@ impl<Op: Operation> Pipeline<Op> {
             let mut buffer = Vec::new();
             reader.read_to_end(&mut buffer).await?;
 
-            let has: crate::history_file::HistoryFileState = serde_json::from_slice(&buffer)?;
-            has.validate()
-                .map_err(|e| anyhow::anyhow!("Invalid HAS format: {}", e))?;
-            Ok::<(crate::history_file::HistoryFileState, Vec<u8>), anyhow::Error>((has, buffer))
+            let state: crate::history_file::HistoryFileState = serde_json::from_slice(&buffer)?;
+            state
+                .validate()
+                .map_err(|e| anyhow::anyhow!("Invalid .well-known format: {}", e))?;
+            Ok::<(crate::history_file::HistoryFileState, Vec<u8>), anyhow::Error>((state, buffer))
         };
 
         // Start fetching other checkpoint files (ledger, transactions, results)
@@ -514,18 +386,19 @@ impl<Op: Operation> Pipeline<Op> {
 
         // Wait for history JSON to be downloaded and parsed
         match history_future.await {
-            Ok((checkpoint_has, buffer)) => {
+            Ok((checkpoint_state, buffer)) => {
                 // Process the history file using the buffered content
                 self.spawn_file_task(history_path.clone(), FileTaskSource::Buffered(buffer));
 
-                // We have the parsed HAS for bucket processing
-                // Now start fetching all bucket files concurrently
+                // We have the parsed state for bucket processing,
+                // start spawning file tasks for all bucket files.
                 let mut bucket_count = 0;
                 let mut dedup_count = 0;
-                for bucket_hash in checkpoint_has.buckets() {
+                for bucket_hash in checkpoint_state.buckets() {
                     if let Ok(path) = history_file::bucket_path(&bucket_hash) {
                         bucket_count += 1;
-                        // Dedup buckets using cache
+                        // Dedup buckets using cache. Note that we only need to dedup
+                        // buckets, all other files are guaranteed to be unique.
                         {
                             let mut cache = bucket_lru.lock().unwrap();
                             if cache.put(bucket_hash.clone(), ()).is_some() {
@@ -561,5 +434,4 @@ impl<Op: Operation> Pipeline<Op> {
     }
 }
 
-// Re-export async_trait
 pub use async_trait::async_trait;

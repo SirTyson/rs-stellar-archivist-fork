@@ -1,71 +1,95 @@
 //! Mirror operation - copies files from source to destination
 
 use crate::history_file;
-use crate::pipeline::{async_trait, Operation, ReaderResult};
-use crate::storage::WRITE_BUF_BYTES;
-use crate::utils::ArchiveStats;
+use crate::pipeline::{async_trait, Operation};
+use crate::storage::{ReaderResult, StorageRef, WRITE_BUF_BYTES};
+use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
 use anyhow::Result;
-use tracing::{debug, error, info};
+use tokio::sync::OnceCell;
+use tracing::{debug, error, info, warn};
 
 pub struct MirrorOperation {
-    dst_op: crate::utils::StorageRef,
+    dst_op: StorageRef,
     overwrite: bool,
     stats: ArchiveStats,
+
+    // User-specified arguments from CLI
+    low: Option<u32>,
+    high: Option<u32>,
+    allow_mirror_gaps: bool,
+
+    // Cached destination checkpoint at start of operation (or None if destination doesn't exist)
+    initial_dest_checkpoint: OnceCell<Option<u32>>,
 }
 
 impl MirrorOperation {
-    pub async fn new(dst: &str, overwrite: bool) -> Result<Self> {
+    pub async fn new(
+        dst: &str,
+        overwrite: bool,
+        low: Option<u32>,
+        high: Option<u32>,
+        allow_mirror_gaps: bool,
+    ) -> Result<Self> {
         let dst_op = crate::storage::StorageBackend::from_url(dst, None).await?;
 
-        // Destination must be a filesystem
-        if !dst.starts_with("file://") {
-            anyhow::bail!("Destination must be a filesystem path (file://...)");
+        // Destination must support write operations
+        if !dst_op.supports_writes() {
+            anyhow::bail!("Destination storage backend does not support write operations. Only filesystem destinations (file://) are currently supported.");
         }
 
         Ok(Self {
             dst_op,
             overwrite,
             stats: ArchiveStats::new(),
+            low,
+            high,
+            allow_mirror_gaps,
+            initial_dest_checkpoint: OnceCell::new(),
         })
     }
 
-    /// Get the destination's latest checkpoint from its HAS file
-    pub async fn get_latest_dest_checkpoint(&self) -> Result<u32> {
-        use crate::utils::fetch_history_archive_state;
-
-        // Read the destination's HAS file - error if it doesn't exist
-        let has = fetch_history_archive_state(&self.dst_op).await?;
-        Ok(has.current_ledger)
+    /// Get the destination's initial checkpoint from .well-known file, caching the result
+    /// Returns None if destination doesn't have a .well-known file
+    async fn get_initial_dest_well_known_checkpoint(&self) -> Option<u32> {
+        self.initial_dest_checkpoint
+            .get_or_init(|| async {
+                // Try to read the destination's .well-known file
+                match fetch_well_known_history_file(&self.dst_op).await {
+                    Ok(has) => Some(has.current_ledger),
+                    Err(_) => None, // No existing archive
+                }
+            })
+            .await
+            .clone()
     }
 
-    /// Update the HAS file to destination if needed
-    async fn maybe_update_has(&self, highest_checkpoint: u32) -> Result<()> {
-        // Check if we should update the HAS file
+    async fn maybe_update_well_known(&self, highest_checkpoint: u32) -> Result<()> {
+        // Check if we should update the .well-known file
         // We should only update if:
-        // 1. There's no existing HAS file, OR
-        // 2. The new checkpoint is higher than the existing HAS
+        // 1. There's no existing .well-known file, or
+        // 2. The new checkpoint is higher than the existing .well-known file
 
-        let should_update = match self.get_latest_dest_checkpoint().await {
-            Ok(existing_ledger) => {
-                let existing_checkpoint = history_file::checkpoint_number(existing_ledger);
+        let should_update = match self.get_initial_dest_well_known_checkpoint().await {
+            Some(existing_ledger) => {
+                let existing_checkpoint = history_file::round_to_lower_checkpoint(existing_ledger);
                 if highest_checkpoint > existing_checkpoint {
                     info!(
-                        "Updating HAS from checkpoint {:08x} to {:08x}",
+                        "Updating .well-known from checkpoint {:08x} to {:08x}",
                         existing_checkpoint, highest_checkpoint
                     );
                     true
                 } else {
                     info!(
-                        "Keeping existing HAS at checkpoint {:08x} (mirrored up to {:08x})",
+                        "Keeping existing .well-known at checkpoint {:08x} (mirrored up to {:08x})",
                         existing_checkpoint, highest_checkpoint
                     );
                     false
                 }
             }
-            Err(_) => {
-                // No existing HAS file - create a new one
+            None => {
+                // No existing .well-known file - create a new one
                 info!(
-                    "No existing HAS, creating new one at checkpoint {:08x}",
+                    "No existing .well-known, creating new one at checkpoint {:08x}",
                     highest_checkpoint
                 );
                 true
@@ -73,43 +97,38 @@ impl MirrorOperation {
         };
 
         if should_update {
-            // Copy the history file at the specified checkpoint to be our HAS file
+            // Copy the history file at the specified checkpoint to be our .well-known file
             let history_path = history_file::checkpoint_path("history", highest_checkpoint);
+            let well_known_path = ".well-known/stellar-history.json";
 
-            // IMPORTANT: Read the history file from DESTINATION, not source!
-            // The source may have advanced since we started mirroring.
-            // We want the HAS to reflect what we actually mirrored.
-            use tokio::io::AsyncReadExt;
-            let mut reader = self
-                .dst_op
-                .open_reader(&history_path)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to read history file: {}", e))?;
-            let mut history_content = Vec::new();
-            reader
-                .read_to_end(&mut history_content)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to read history content: {}", e))?;
+            let dst_base = self.dst_op.get_base_path().ok_or_else(|| {
+                anyhow::anyhow!("Destination storage doesn't have a filesystem path")
+            })?;
 
-            // Write it as the .well-known/stellar-history.json
-            let has_path = ".well-known/stellar-history.json";
-            let mut writer = self
-                .dst_op
-                .open_writer(has_path)
+            let src_file = dst_base.join(&history_path);
+            let dst_file = dst_base.join(well_known_path);
+
+            // Check if the history file exists (it might not if the mirror had failures)
+            if !src_file.exists() {
+                anyhow::bail!(
+                    "Cannot update .well-known: history file at checkpoint {:08x} was not successfully mirrored",
+                    highest_checkpoint
+                );
+            }
+
+            // Ensure the .well-known directory exists
+            if let Some(parent) = dst_file.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    anyhow::anyhow!("Failed to create .well-known directory: {}", e)
+                })?;
+            }
+
+            tokio::fs::copy(&src_file, &dst_file)
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to open HAS file for writing: {}", e))?;
-            use tokio::io::AsyncWriteExt;
-            writer
-                .write_all(&history_content)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to write HAS file: {}", e))?;
-            writer
-                .flush()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to flush HAS file: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to copy history to .well-known: {}", e))?;
 
             info!(
-                "Updated destination HAS to checkpoint {:08x}",
+                "Updated destination .well-known to checkpoint {:08x}",
                 highest_checkpoint
             );
         }
@@ -120,16 +139,96 @@ impl MirrorOperation {
 
 #[async_trait]
 impl Operation for MirrorOperation {
+    async fn get_checkpoint_bounds(&self, source: &StorageRef) -> Result<(u32, u32)> {
+        // Determine the effective low checkpoint based on destination .well-known/stellar-history.json and flags
+        //
+        // Starting ledger logic:
+        // 1. If --low is specified:
+        //    - Check for gaps between destination and requested low and fail early (error unless --allow-mirror-gaps)
+        //    - If destination is ahead of --low:
+        //      * With --overwrite: honor the --low value
+        //      * Without --overwrite: ignore --low and resume from destination
+        // 2. If --low is not specified:
+        //    - If destination exists: continue from destination checkpoint (regardless of --overwrite)
+        //    - If destination doesn't exist: start from genesis checkpoint
+
+        let dest_checkpoint_opt = self.get_initial_dest_well_known_checkpoint().await;
+        let effective_low = if let Some(requested_low) = self.low {
+            // User specified --low
+            if let Some(dest_ledger) = dest_checkpoint_opt {
+                // Destination archive already exists and has a .well-known/stellar-history.json file
+                let dest_checkpoint = history_file::round_to_lower_checkpoint(dest_ledger);
+                let requested_checkpoint = history_file::round_to_lower_checkpoint(requested_low);
+
+                // Check for gaps between highest destination checkpoint and requested low
+                if dest_checkpoint < requested_checkpoint {
+                    if !self.allow_mirror_gaps {
+                        anyhow::bail!(
+                            "Cannot mirror: destination archive ends at ledger {} (checkpoint 0x{:08x}) but --low is {} (checkpoint 0x{:08x}). This would create a gap in the archive. Use --allow-mirror-gaps to proceed anyway.",
+                            dest_ledger, dest_checkpoint, requested_low, requested_checkpoint
+                        );
+                    } else {
+                        warn!(
+                            "WARNING: Creating gap in archive! Destination ends at ledger {} (checkpoint 0x{:08x}) but mirroring from {} (checkpoint 0x{:08x})",
+                            dest_ledger, dest_checkpoint, requested_low, requested_checkpoint
+                        );
+                    }
+
+                    // Start at --low value
+                    Some(requested_low)
+                } else {
+                    // Destination has checkpoint >= --low request
+                    if self.overwrite {
+                        // In overwrite mode, honor the --low request
+                        info!(
+                            "Destination already has checkpoint 0x{:08x} (ledger {}), overwriting from ledger {} (checkpoint 0x{:08x})",
+                            dest_checkpoint, dest_ledger, requested_low, requested_checkpoint
+                        );
+                        Some(requested_low)
+                    } else {
+                        // Not in overwrite mode - ignore --low and resume from destination
+                        warn!(
+                            "Ignoring --low {} since destination already has checkpoint 0x{:08x} (ledger {}). Resuming from next checkpoint.",
+                            requested_low, dest_checkpoint, dest_ledger
+                        );
+                        // Resume from the next checkpoint after what's already mirrored
+                        Some(dest_ledger + 1)
+                    }
+                }
+            } else {
+                debug!(
+                    "Destination archive does not exist, proceeding with --low {}",
+                    requested_low
+                );
+                // No destination archive, use the requested low
+                Some(requested_low)
+            }
+        } else {
+            // No --low specified - mirror starting from last checkpoint in destination archive
+            // (This applies whether --overwrite is set or not)
+            if let Some(checkpoint_ledger) = dest_checkpoint_opt {
+                info!(
+                    "Found existing archive at destination with ledger {}, resuming from next checkpoint",
+                    checkpoint_ledger
+                );
+                // Resume from the next checkpoint after what's already mirrored
+                Some(checkpoint_ledger + 1)
+            } else {
+                debug!("Destination archive does not exist, starting from beginning");
+                None
+            }
+        };
+
+        compute_checkpoint_bounds(source, effective_low, self.high).await
+    }
+
     async fn process_object(&self, path: &str, reader_result: ReaderResult) {
-        // Handle case where we couldn't get a reader (source file missing/inaccessible)
         let mut reader = match reader_result {
             ReaderResult::Ok(r) => r,
             ReaderResult::Err(e) => {
                 // Source file couldn't be read - count as failure
                 error!("Failed to read source file {}: {}", path, e);
-                self.stats
-                    .record_failure(path, &format!("Source read error: {}", e))
-                    .await;
+                self.stats.record_failure(path).await;
                 return;
             }
         };
@@ -142,7 +241,7 @@ impl Operation for MirrorOperation {
                     return;
                 } else {
                     // Proceed with overwrite
-                    debug!("Overwriting existing file: {}", path);
+                    info!("Overwriting existing file: {}", path);
                 }
             }
             Ok(false) => {
@@ -151,9 +250,7 @@ impl Operation for MirrorOperation {
             Err(e) => {
                 // Failed to check existence - treat as error
                 error!("Failed to check existence of file {}: {}", path, e);
-                self.stats
-                    .record_failure(path, &format!("Existence check failed: {}", e))
-                    .await;
+                self.stats.record_failure(path).await;
                 return;
             }
         }
@@ -177,24 +274,18 @@ impl Operation for MirrorOperation {
             }
             Err(e) => {
                 error!("Failed to write file {}: {}", path, e);
-                self.stats
-                    .record_failure(path, &format!("Write error: {}", e))
-                    .await;
+                self.stats.record_failure(path).await;
             }
         }
     }
 
-    async fn finalize(&self, highest_checkpoint: Option<u32>) -> Result<()> {
-        // Generate and log complete report
+    async fn finalize(&self, highest_checkpoint: u32) -> Result<()> {
         self.stats.report("mirror").await;
 
-        // Update HAS file if we processed any checkpoints
-        if let Some(highest) = highest_checkpoint {
-            // Update HAS file if needed (only if we're advancing it)
-            if let Err(e) = self.maybe_update_has(highest).await {
-                error!("Failed to update HAS file: {}", e);
-                return Err(e);
-            }
+        // Update .well-known file with the highest checkpoint we processed
+        if let Err(e) = self.maybe_update_well_known(highest_checkpoint).await {
+            error!("Failed to update .well-known file: {}", e);
+            return Err(e);
         }
 
         // Report failure if there were any failed files

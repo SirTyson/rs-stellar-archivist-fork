@@ -12,6 +12,16 @@ pub const WRITE_BUF_BYTES: usize = 128 * 1024;
 pub type BoxedAsyncRead = Box<dyn tokio::io::AsyncRead + Send + Unpin + 'static>;
 pub type BoxedAsyncWrite = Box<dyn tokio::io::AsyncWrite + Send + Unpin + 'static>;
 
+pub type StorageRef = Arc<dyn Storage + Send + Sync>;
+
+/// Result from attempting to get a reader for an object
+pub enum ReaderResult {
+    /// Successfully obtained a reader
+    Ok(BoxedAsyncRead),
+    /// Failed to get reader (file missing or inaccessible)
+    Err(anyhow::Error),
+}
+
 #[derive(Clone, Debug)]
 pub struct ObjectInfo {
     pub size_bytes: Option<u64>,
@@ -32,6 +42,16 @@ pub trait Storage: Send + Sync {
             io::ErrorKind::Unsupported,
             "Write not supported by this backend",
         ))
+    }
+
+    /// Check if this backend supports write operations
+    fn supports_writes(&self) -> bool {
+        false
+    }
+
+    /// Get the base filesystem path if this is a filesystem backend
+    fn get_base_path(&self) -> Option<&std::path::Path> {
+        None // Default to None, only FileStore overrides this
     }
 }
 
@@ -77,6 +97,14 @@ impl Storage for FileStore {
 
         let file = tokio::fs::File::create(full_path).await?;
         Ok(Box::new(file))
+    }
+
+    fn supports_writes(&self) -> bool {
+        true // FileStore supports write operations
+    }
+
+    fn get_base_path(&self) -> Option<&std::path::Path> {
+        Some(&self.root_dir)
     }
 }
 
@@ -394,6 +422,20 @@ impl Storage for StorageBackend {
         match self {
             StorageBackend::File(s) => s.open_writer(object).await,
             StorageBackend::Http(s) => s.open_writer(object).await,
+        }
+    }
+
+    fn supports_writes(&self) -> bool {
+        match self {
+            StorageBackend::File(s) => s.supports_writes(),
+            StorageBackend::Http(s) => s.supports_writes(),
+        }
+    }
+
+    fn get_base_path(&self) -> Option<&std::path::Path> {
+        match self {
+            StorageBackend::File(s) => s.get_base_path(),
+            StorageBackend::Http(s) => s.get_base_path(),
         }
     }
 }
